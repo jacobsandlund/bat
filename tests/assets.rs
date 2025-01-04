@@ -19,6 +19,7 @@ fn all_themes_are_present() {
             "DarkNeon",
             "Dracula",
             "GitHub",
+            "GitHub-diff",
             "Monokai Extended",
             "Monokai Extended Bright",
             "Monokai Extended Light",
