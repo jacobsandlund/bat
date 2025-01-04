@@ -52,7 +52,7 @@
               <key>fontStyle</key>
               <string></string>
               <key>foreground</key>
-              <string>#b31db3</string>
+              <string>#a71d87</string>
           </dict>
       </dict>
       <dict>
@@ -65,7 +65,7 @@
               <key>fontStyle</key>
               <string></string>
               <key>foreground</key>
-              <string>#7a00b3</string>
+              <string>#8c4da8</string>
           </dict>
       </dict>
       <dict>
@@ -78,7 +78,7 @@
               <key>fontStyle</key>
               <string></string>
               <key>foreground</key>
-              <string>#b31db3</string>
+              <string>#a71d87</string>
           </dict>
       </dict>
       <dict>
@@ -91,7 +91,7 @@
               <key>fontStyle</key>
               <string></string>
               <key>foreground</key>
-              <string>#b31db3</string>
+              <string>#a71d87</string>
           </dict>
       </dict>
       <dict>
@@ -104,7 +104,7 @@
               <key>fontStyle</key>
               <string></string>
               <key>foreground</key>
-              <string>#7a00b3</string>
+              <string>#8c4da8</string>
           </dict>
       </dict>
       <dict>
@@ -183,7 +183,7 @@
               <key>fontStyle</key>
               <string></string>
               <key>foreground</key>
-              <string>#7a00b3</string>
+              <string>#8c4da8</string>
           </dict>
       </dict>
       <dict>
@@ -218,7 +218,7 @@
               <key>fontStyle</key>
               <string></string>
               <key>foreground</key>
-              <string>#7a00b3</string>
+              <string>#8c4da8</string>
           </dict>
       </dict>
       <dict>
@@ -417,7 +417,7 @@
               <key>fontStyle</key>
               <string></string>
               <key>foreground</key>
-              <string>#7a00b3</string>
+              <string>#8c4da8</string>
           </dict>
       </dict>
 
@@ -429,7 +429,7 @@
           <key>settings</key>
           <dict>
               <key>foreground</key>
-              <string>#7a00b3</string>
+              <string>#8c4da8</string>
               <key>fontStyle</key>
               <string></string>
           </dict>
