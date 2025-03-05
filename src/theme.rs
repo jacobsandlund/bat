@@ -10,9 +10,9 @@ pub mod env {
     /// See [`crate::theme::ThemeOptions::theme`].
     pub const BAT_THEME: &str = "BAT_THEME";
     /// See [`crate::theme::ThemeOptions::theme_dark`].
-    pub const BAT_THEME_DARK: &str = "BAT_THEME";
+    pub const BAT_THEME_DARK: &str = "BAT_THEME_DARK";
     /// See [`crate::theme::ThemeOptions::theme_light`].
-    pub const BAT_THEME_LIGHT: &str = "BAT_THEME";
+    pub const BAT_THEME_LIGHT: &str = "BAT_THEME_LIGHT";
 }
 
 /// Chooses an appropriate theme or falls back to a default theme
@@ -383,7 +383,6 @@ mod tests {
                         theme: ThemePreference::Fixed(ThemeName::Named("Theme".to_string())),
                         theme_dark: Some(ThemeName::Named("Dark Theme".to_string())),
                         theme_light: Some(ThemeName::Named("Light Theme".to_string())),
-                        ..Default::default()
                     },
                 ] {
                     let detector = ConstantDetector(color_scheme);
@@ -509,7 +508,7 @@ mod tests {
                 ThemePreference::Light,
             ];
             for pref in prefs {
-                assert_eq!(pref, ThemePreference::new(&pref.to_string()));
+                assert_eq!(pref, ThemePreference::new(pref.to_string()));
             }
         }
     }

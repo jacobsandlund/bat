@@ -21,16 +21,7 @@
 
 ### Sponsors
 
-A special *thank you* goes to our biggest <a href="doc/sponsors.md">sponsors</a>:<br>
-<a href="https://workos.com/?utm_campaign=github_repo&utm_medium=referral&utm_content=bat&utm_source=github">
-  <img src="doc/sponsors/workos-logo-white-bg.svg" width="200" alt="WorkOS">
-  <br>
-  <strong>Your app, enterprise-ready.</strong>
-  <br>
-  <sub>Start selling to enterprise customers with just a few lines of code.</sub>
-  <br>
-  <sup>Add Single Sign-On (and more) in minutes instead of months.</sup>
-</a>
+A special *thank you* goes to our biggest <a href="doc/sponsors.md">sponsor</a>:<br>
 
 <a href="https://www.warp.dev/?utm_source=github&utm_medium=referral&utm_campaign=bat_20231001">
   <img src="doc/sponsors/warp-logo.png" width="200" alt="Warp">
@@ -221,6 +212,12 @@ Note that the [Manpage syntax](assets/syntaxes/02_Extra/Manpage.sublime-syntax) 
 #### `prettier` / `shfmt` / `rustfmt`
 
 The [`prettybat`](https://github.com/eth-p/bat-extras/blob/master/doc/prettybat.md) script is a wrapper that will format code and print it with `bat`.
+
+#### `Warp`
+
+<a href="https://app.warp.dev/drive/folder/-Bat-Warp-Pack-lxhe7HrEwgwpG17mvrFSz1">
+  <img src="doc/sponsors/warp-pack-header.png" alt="Warp">
+</a>
 
 #### Highlighting `--help` messages
 
@@ -455,7 +452,7 @@ binaries are also available: look for archives with `musl` in the file name.
 
 ### From source
 
-If you want to build `bat` from source, you need Rust 1.70.0 or
+If you want to build `bat` from source, you need Rust 1.74.0 or
 higher. You can then use `cargo` to build everything:
 
 ```bash
@@ -489,7 +486,7 @@ bat --list-themes | fzf --preview="bat --theme={} --color=always /path/to/file"
 ```
 
 `bat` automatically picks a fitting theme depending on your terminal's background color.
-You can use the `--theme-light` / `--theme-light` options or the `BAT_THEME_DARK` / `BAT_THEME_LIGHT` environment variables
+You can use the `--theme-dark` / `--theme-light` options or the `BAT_THEME_DARK` / `BAT_THEME_LIGHT` environment variables
 to customize the themes used. This is especially useful if you frequently switch between dark and light mode.
 
 You can also use a custom theme by following the

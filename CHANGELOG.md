@@ -2,6 +2,35 @@
 
 ## Features
 
+## Bugfixes
+
+- Fix `BAT_THEME_DARK` and `BAT_THEME_LIGHT` being ignored, see issue #3171 and PR #3168 (@bash)
+- Prevent `--list-themes` from outputting default theme info to stdout when it is piped, see #3189 (@einfachIrgendwer0815)
+- Rename some submodules to fix Dependabot submodule updates, see issue #3198 and PR #3201 (@victor-gp)
+
+## Other
+
+- Work around build failures when building `bat` from vendored sources #3179 (@dtolnay)
+
+## Syntaxes
+
+- Add syntax mapping for `paru` configuration files #3182 (@cyqsimon)
+- Add support for [Idris 2 programming language](https://www.idris-lang.org/) #3150 (@buzden)
+- Add syntax mapping for `nix`'s '`flake.lock` lockfiles #3196 (@odilf)
+- Improvements to CSV/TSV highlighting, with autodetection of delimiter and support for TSV files, see #3186 (@keith-
+- Improve (Sys)log error highlighting, see #3205 (@keith-hall)
+- Map `ndjson` extension to JSON syntax, see #3209 (@keith-hall)
+- Map files with `csproj`, `vbproj`, `props` and `targets` extensions to XML syntax, see #3213 (@keith-hall)
+- Add debsources syntax to highlight `/etc/apt/sources.list` files, see #3215 (@keith-hall)
+
+## Themes
+
+## `bat` as a library
+
+# v0.25.0
+
+## Features
+
 - Set terminal title to file names when Paging is not Paging::Never #2807 (@Oliver-Looney)
 - `bat --squeeze-blank`/`bat -s` will now squeeze consecutive empty lines, see #1441 (@eth-p) and #2665 (@einfachIrgendwer0815)
 - `bat --squeeze-limit` to set the maximum number of empty consecutive when using `--squeeze-blank`, see #1441 (@eth-p) and #2665 (@einfachIrgendwer0815)

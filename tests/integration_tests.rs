@@ -305,11 +305,12 @@ fn list_themes_without_colors() {
 
 #[test]
 fn list_themes_to_piped_output() {
-    bat()
-        .arg("--list-themes")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("(default)").not());
+    bat().arg("--list-themes").assert().success().stdout(
+        predicate::str::contains("(default)")
+            .not()
+            .and(predicate::str::contains("(default light)").not())
+            .and(predicate::str::contains("(default dark)").not()),
+    );
 }
 
 #[test]
@@ -1831,7 +1832,7 @@ fn do_not_panic_regression_tests() {
     ] {
         bat()
             .arg("--color=always")
-            .arg(&format!("regression_tests/{filename}"))
+            .arg(format!("regression_tests/{filename}"))
             .assert()
             .success();
     }
@@ -1844,7 +1845,7 @@ fn do_not_detect_different_syntax_for_stdin_and_files() {
     let cmd_for_file = bat()
         .arg("--color=always")
         .arg("--map-syntax=*.js:Markdown")
-        .arg(&format!("--file-name={file}"))
+        .arg(format!("--file-name={file}"))
         .arg("--style=plain")
         .arg(file)
         .assert()
@@ -1854,7 +1855,7 @@ fn do_not_detect_different_syntax_for_stdin_and_files() {
         .arg("--color=always")
         .arg("--map-syntax=*.js:Markdown")
         .arg("--style=plain")
-        .arg(&format!("--file-name={file}"))
+        .arg(format!("--file-name={file}"))
         .pipe_stdin(Path::new(EXAMPLES_DIR).join(file))
         .unwrap()
         .assert()
@@ -1873,7 +1874,7 @@ fn no_first_line_fallback_when_mapping_to_invalid_syntax() {
     bat()
         .arg("--color=always")
         .arg("--map-syntax=*.invalid-syntax:InvalidSyntax")
-        .arg(&format!("--file-name={file}"))
+        .arg(format!("--file-name={file}"))
         .arg("--style=plain")
         .arg(file)
         .assert()
@@ -2262,6 +2263,46 @@ fn theme_arg_overrides_env_withconfig() {
         .assert()
         .success()
         .stdout("\x1B[4mAnsi Underscore Test\n\x1B[24mAnother Line")
+        .stderr("");
+}
+
+#[test]
+fn theme_light_env_var_is_respected() {
+    bat()
+        .env("BAT_THEME_LIGHT", "Coldark-Cold")
+        .env("COLORTERM", "truecolor")
+        .arg("--theme=light")
+        .arg("--paging=never")
+        .arg("--color=never")
+        .arg("--terminal-width=80")
+        .arg("--wrap=never")
+        .arg("--decorations=always")
+        .arg("--style=plain")
+        .arg("--highlight-line=1")
+        .write_stdin("Lorem Ipsum")
+        .assert()
+        .success()
+        .stdout("\x1B[48;2;208;218;231mLorem Ipsum\x1B[0m")
+        .stderr("");
+}
+
+#[test]
+fn theme_dark_env_var_is_respected() {
+    bat()
+        .env("BAT_THEME_DARK", "Coldark-Dark")
+        .env("COLORTERM", "truecolor")
+        .arg("--theme=dark")
+        .arg("--paging=never")
+        .arg("--color=never")
+        .arg("--terminal-width=80")
+        .arg("--wrap=never")
+        .arg("--decorations=always")
+        .arg("--style=plain")
+        .arg("--highlight-line=1")
+        .write_stdin("Lorem Ipsum")
+        .assert()
+        .success()
+        .stdout("\x1B[48;2;33;48;67mLorem Ipsum\x1B[0m")
         .stderr("");
 }
 
