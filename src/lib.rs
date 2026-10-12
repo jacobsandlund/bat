@@ -38,7 +38,7 @@ mod less;
 mod lessopen;
 pub mod line_range;
 pub(crate) mod nonprintable_notation;
-mod output;
+pub mod output;
 #[cfg(feature = "paging")]
 mod pager;
 #[cfg(feature = "paging")]
@@ -54,6 +54,7 @@ mod vscreen;
 pub(crate) mod wrapping;
 
 pub use nonprintable_notation::{BinaryBehavior, NonprintableNotation};
+pub use preprocessor::sanitize_for_terminal;
 pub use preprocessor::StripAnsiMode;
 pub use pretty_printer::{Input, PrettyPrinter, Syntax};
 pub use syntax_mapping::{MappingTarget, SyntaxMapping};

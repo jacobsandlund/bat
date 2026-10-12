@@ -14,7 +14,8 @@ It also communicates with git(1) to show modifications with respect to the git i
 
 Whenever the output of {{PROJECT_EXECUTABLE}} goes to a non-interactive terminal, i.e. when the
 output is piped into another process or into a file, {{PROJECT_EXECUTABLE}} will act as a drop-in
-replacement for cat(1) and fall back to printing the plain file contents.
+replacement for cat(1) and fall back to printing the plain file contents,
+unless an explicit style is requested.
 
 .SH "OPTIONS"
 General remarks: Command-line options like '-l'/'--language' that take values can be specified as
@@ -36,6 +37,23 @@ Use character sequences like ^G, ^J, ^@, .. to identify non-printable characters
 .IP "unicode"
 Use special Unicode code points to identify non-printable characters
 .RE
+.HP
+\fB\-\-binary\fR <behavior>
+.IP
+How to treat binary content.
+
+Possible values:
+.RS
+.IP "no\-printing"
+Do not print any binary content (default)
+.IP "as\-text"
+Treat binary content as normal text
+.RE
+.HP
+\fB\-\-completion\fR <SHELL>
+.IP
+Show shell completion for a certain shell.
+Possible values: bash, fish, zsh, ps1
 .HP
 \fB\-p\fR, \fB\-\-plain\fR
 .IP
@@ -84,8 +102,10 @@ Set the tab width to T spaces. Use a width of 0 to pass tabs through directly
 .HP
 \fB\-\-wrap\fR <mode>
 .IP
-Specify the text\-wrapping mode (*auto*, never, character). The '\-\-terminal\-width' option
-can be used in addition to control the output width.
+Specify the text\-wrapping mode (*auto*, never, character, word). The '\-\-terminal\-width' option
+can be used in addition to control the output width. In \fBword\fR mode, lines are broken at
+whitespace boundaries. If a single word exceeds the terminal width, it falls back to
+character wrapping.
 .HP
 \fB\-S\fR, \fB\-\-chop\-long\-lines\fR
 .IP
@@ -114,7 +134,8 @@ always, *never*.
 \fB\-\-decorations\fR <when>
 .IP
 Specify when to use the decorations that have been specified via '\-\-style'. The
-automatic mode only enables decorations if an interactive terminal is detected. Possible
+automatic mode only enables decorations if an interactive terminal is detected. The
+always mode will show decorations even when piping output. Possible
 values: *auto*, never, always.
 .HP
 \fB\-f\fR, \fB\-\-force\-colorization\fR
@@ -132,8 +153,9 @@ which pager is used, see the '\-\-pager' option. Possible values: *auto*, never,
 \fB\-\-pager\fR <command>
 .IP
 Determine which pager is used. This option will override the PAGER and BAT_PAGER
-environment variables. The default pager is 'less'. To control when the pager is used, see
-the '\-\-paging' option. Example: '\-\-pager "less \fB\-RF\fR"'.
+environment variables. The default pager is 'less'. If you provide '\-\-pager=builtin', use
+the built-in 'minus' pager. To control when the pager is used, see the '\-\-paging' option.
+Example: '\-\-pager "less \fB\-RF\fR"'.
 
 Note: By default, if the pager is set to 'less' (and no command-line options are specified), 'bat' will pass the following command line options to the pager: '-R'/'--RAW-CONTROL-CHARS', '-F'/'--quit-if-one-screen' and '-X'/'--no-init'. The last option ('-X') is only used for 'less' versions older than 530. The '-R' option is needed to interpret ANSI colors correctly. The second option ('-F') instructs less to exit immediately if the output size is smaller than the vertical size of the terminal. This is convenient for small files because you do not have to press 'q' to quit the pager. The third option ('-X') is needed to fix a bug with the '--quit-if-one-screen' feature in old versions of 'less'. Unfortunately, it also breaks mouse-wheel support in 'less'. If you want to enable mouse-wheel scrolling on older versions of 'less', you can pass just '-R' (as in the example above, this will disable the quit-if-one-screen feature). For less 530 or newer, it should work out of the box.
 .HP
@@ -180,8 +202,8 @@ This option only has an effect when \fB\-\-theme\fP option is set to \fBauto\fR 
 .HP
 \fB\-\-theme\-light\fR <theme>
 .IP
-Sets the theme name for syntax highlighting used when the terminal uses a dark background.
-To set a default theme, add the \fB\-\-theme-dark="..."\fP option to the configuration file or
+Sets the theme name for syntax highlighting used when the terminal uses a light background.
+To set a default theme, add the \fB\-\-theme-light="..."\fP option to the configuration file or
 export the \fBBAT_THEME_LIGHT\fP environment variable (e.g. \fBexport BAT_THEME_LIGHT="..."\fP).
 This option only has an effect when \fB\-\-theme\fP option is set to \fBauto\fR or \fBlight\fR.
 .HP
@@ -197,14 +219,30 @@ Squeeze consecutive empty lines into a single empty line.
 .IP
 Set the maximum number of consecutive empty lines to be printed.
 .HP
+\fB\-\-strip\-ansi\fR <when>
+.IP
+Specify when to strip ANSI escape sequences from the input. The automatic mode will remove
+escape sequences unless the syntax highlighting language is plain text. Possible values:
+auto, always, *never*.
+.HP
 \fB\-\-style\fR <style\-components>
 .IP
 Configure which elements (line numbers, file headers, grid borders, Git modifications,
 \&..) to display in addition to the file contents. The argument is a comma\-separated list
 of components to display (e.g. 'numbers,changes,grid') or a pre\-defined style ('full').
 To set a default style, add the '\-\-style=".."' option to the configuration file or
-export the BAT_STYLE environment variable (e.g.: export BAT_STYLE=".."). Possible
-values: *default*, full, auto, plain, changes, header, header-filename, header-filesize, grid,
+export the BAT_STYLE environment variable (e.g.: export BAT_STYLE="..").
+.IP
+When styles are specified in multiple places, the "nearest" set of styles take precedence.
+The command\-line arguments are the highest priority, followed by the BAT_STYLE environment
+variable, and then the configuration file. If any set of styles consists entirely of
+components prefixed with "+" or "\-", it will modify the previous set of styles instead of
+replacing them.
+.IP
+By default, the following components are enabled:
+changes, grid, header\-filename, numbers, snip
+.IP
+Possible values: *default*, full, auto, plain, changes, header, header-filename, header-filesize, grid,
 rule, numbers, snip.
 .HP
 \fB\-r\fR, \fB\-\-line\-range\fR <N:M>...
@@ -227,8 +265,10 @@ Display a list of supported languages for syntax highlighting.
 .HP
 \fB\-u\fR, \fB\-\-unbuffered\fR
 .IP
-This option exists for POSIX\-compliance reasons ('u' is for 'unbuffered'). The output is
-always unbuffered \- this option is simply ignored.
+Enable unbuffered input reading. When this flag is set, bat will display data as soon as it
+is available, without waiting for a complete line. This is useful for streaming use cases like
+\&'tail \-f logfile | bat \-u \-\-paging=never'. Note that line numbers are automatically disabled
+in unbuffered mode, and syntax highlighting may be imperfect on partial lines.
 .HP
 \fB\-\-no\-custom\-assets\fR
 .IP
@@ -245,6 +285,10 @@ Show bat's cache directory.
 \fB\-\-diagnostic\fR
 .IP
 Show diagnostic information for bug reports.
+.HP
+\fB\-\-quiet\-empty\fR
+.IP
+Do not produce any output when the input is empty (e.g. an empty file or empty stdin). This is useful in scripts where silent behavior is preferred for empty input.
 .HP
 \fB\-\-acknowledgements\fR
 .IP

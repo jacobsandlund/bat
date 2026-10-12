@@ -28,6 +28,9 @@ pub enum Error {
     InvalidPagerValueBat,
     #[error("{0}")]
     Msg(String),
+    #[cfg(feature = "paging")]
+    #[error(transparent)]
+    MinusError(#[from] ::minus::MinusError),
     #[cfg(feature = "lessopen")]
     #[error(transparent)]
     VarError(#[from] ::std::env::VarError),
@@ -60,14 +63,18 @@ pub fn default_error_handler(error: &Error, output: &mut dyn Write) {
         Error::SerdeYamlError(_) => {
             writeln!(
                 output,
-                "{}: Error while parsing metadata.yaml file: {}",
+                "{}: Error while parsing metadata.yaml file: {error}",
                 Red.paint("[bat error]"),
-                error
             )
             .ok();
         }
         _ => {
-            writeln!(output, "{}: {}", Red.paint("[bat error]"), error).ok();
+            writeln!(
+                &mut std::io::stderr().lock(),
+                "{}: {error}",
+                Red.paint("[bat error]"),
+            )
+            .ok();
         }
     };
 }

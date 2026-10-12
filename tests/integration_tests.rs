@@ -25,10 +25,8 @@ mod unix {
 use unix::*;
 
 mod utils;
-use utils::command::{bat, bat_with_config};
+use utils::command::{bat, bat_raw_command, bat_raw_command_with_config, bat_with_config};
 
-#[cfg(unix)]
-use utils::command::bat_raw_command;
 use utils::mocked_pagers;
 
 const EXAMPLES_DIR: &str = "tests/examples";
@@ -58,6 +56,67 @@ fn stdin() {
         .assert()
         .success()
         .stdout("foo\nbar\n");
+}
+
+/// Runs `bat` with `args` while its stdout is a pipe whose read end has
+/// already been closed, so the very first write fails with `BrokenPipe`
+/// (EPIPE on Unix, `ERROR_NO_DATA` on Windows).
+fn assert_quiet_exit_when_stdout_is_closed(command: &mut std::process::Command, args: &[&str]) {
+    use std::process::Stdio;
+
+    let (pipe_reader, pipe_writer) = std::io::pipe().expect("could not create a pipe");
+    drop(pipe_reader);
+
+    let output = command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(pipe_writer)
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|child| child.wait_with_output())
+        .expect("could not run bat");
+
+    assert!(
+        output.status.success(),
+        "bat {args:?} should exit quietly when stdout is closed, status: {}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "bat {args:?} should not print to stderr when stdout is closed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn auxiliary_output_does_not_panic_on_closed_stdout() {
+    // Auxiliary outputs used to be written via `println!`, which panics when
+    // the reader of a piped stdout is already gone (e.g. `bat --config-file |
+    // head -n 0`). The main output path has exited quietly on `BrokenPipe`
+    // since #232; auxiliary outputs should behave the same way.
+    assert_quiet_exit_when_stdout_is_closed(&mut bat_raw_command(), &["--config-file"]);
+    assert_quiet_exit_when_stdout_is_closed(&mut bat_raw_command(), &["--diagnostic"]);
+
+    // The `cache` subcommand is only enabled when the working directory does
+    // not contain a file named `cache` (see `cache_clear`), and it conflicts
+    // with top-level flags like `--no-config`. Run it from a temporary
+    // directory that doubles as `BAT_CACHE_PATH`, leaving the real cache alone.
+    let temp_dir = tempdir().expect("could not create a temporary directory");
+    let mut command = bat_raw_command_with_config();
+    command
+        .current_dir(temp_dir.path())
+        .env("BAT_CONFIG_PATH", temp_dir.path().join("config"))
+        .env("BAT_CACHE_PATH", temp_dir.path());
+    assert_quiet_exit_when_stdout_is_closed(&mut command, &["cache", "--clear"]);
+}
+
+#[cfg(feature = "application")]
+#[test]
+fn completion_does_not_panic_on_closed_stdout() {
+    for shell in ["bash", "fish", "ps1", "zsh"] {
+        assert_quiet_exit_when_stdout_is_closed(&mut bat_raw_command(), &["--completion", shell]);
+    }
 }
 
 #[test]
@@ -163,7 +222,181 @@ fn line_numbers() {
         .arg("--decorations=always")
         .assert()
         .success()
-        .stdout("   1 line 1\n   2 line 2\n   3 line 3\n   4 line 4\n");
+        .stdout("   1 line 1\n   2 line 2\n   3 line 3\n   4 line 4\n   5 line 5\n   6 line 6\n   7 line 7\n   8 line 8\n   9 line 9\n  10 line 10\n");
+}
+
+// Test that -n on command line shows line numbers even when piping (similar to `cat -n`)
+#[test]
+fn line_numbers_from_cli_in_loop_through_mode() {
+    bat()
+        .arg("multiline.txt")
+        .arg("-n")
+        .assert()
+        .success()
+        .stdout("   1 line 1\n   2 line 2\n   3 line 3\n   4 line 4\n   5 line 5\n   6 line 6\n   7 line 7\n   8 line 8\n   9 line 9\n  10 line 10\n");
+}
+
+#[test]
+fn style_from_env_var_ignored_and_line_numbers_from_cli_in_loop_through_mode() {
+    bat()
+        .env("BAT_STYLE", "full")
+        .arg("multiline.txt")
+        .arg("-n")
+        .arg("--decorations=auto")
+        .assert()
+        .success()
+        .stdout("   1 line 1\n   2 line 2\n   3 line 3\n   4 line 4\n   5 line 5\n   6 line 6\n   7 line 7\n   8 line 8\n   9 line 9\n  10 line 10\n");
+}
+
+#[test]
+fn numbers_ignored_from_cli_when_followed_by_plain_in_loop_through_mode() {
+    bat()
+        .arg("multiline.txt")
+        .arg("-np")
+        .arg("--decorations=auto")
+        .assert()
+        .success()
+        .stdout(
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n",
+        );
+}
+
+#[test]
+fn numbers_honored_from_cli_when_preceeded_by_plain_in_loop_through_mode() {
+    bat()
+        .arg("multiline.txt")
+        .arg("-pn")
+        .arg("--decorations=auto")
+        .assert()
+        .success()
+        .stdout("   1 line 1\n   2 line 2\n   3 line 3\n   4 line 4\n   5 line 5\n   6 line 6\n   7 line 7\n   8 line 8\n   9 line 9\n  10 line 10\n");
+}
+
+#[test]
+fn repeated_combined_flags_use_last_number_or_plain_flag() {
+    bat()
+        .arg("multiline.txt")
+        .arg("-npn")
+        .arg("--decorations=auto")
+        .assert()
+        .success()
+        .stdout("   1 line 1\n   2 line 2\n   3 line 3\n   4 line 4\n   5 line 5\n   6 line 6\n   7 line 7\n   8 line 8\n   9 line 9\n  10 line 10\n");
+
+    bat()
+        .arg("multiline.txt")
+        .arg("-pnp")
+        .arg("--decorations=auto")
+        .assert()
+        .success()
+        .stdout(
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n",
+        );
+
+    bat()
+        .arg("empty_lines.txt")
+        .arg("-pbp")
+        .arg("--decorations=auto")
+        .assert()
+        .success()
+        .stdout("line 1\n\n\n\nline 5\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nline 20\nline 21\n\n\nline 24\n\nline 26\n\n\n\nline 30\n");
+
+    bat()
+        .arg("empty_lines.txt")
+        .arg("-bpb")
+        .arg("--decorations=auto")
+        .assert()
+        .success()
+        .stdout("   1 line 1\n     \n     \n     \n   2 line 5\n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n   3 line 20\n   4 line 21\n     \n     \n   5 line 24\n     \n   6 line 26\n     \n     \n     \n   7 line 30\n");
+}
+
+#[test]
+fn option_terminator_keeps_filename_from_number_flags() {
+    let tmp_dir = tempdir().expect("can create temporary directory");
+    std::fs::write(tmp_dir.path().join("-b"), "hello\nworld\n").expect("can write temporary file");
+
+    bat()
+        .current_dir(tmp_dir.path())
+        .args(["--", "-b"])
+        .assert()
+        .success()
+        .stdout("hello\nworld\n");
+}
+
+#[test]
+fn attached_short_option_values_are_not_treated_as_flags() {
+    let tmp_dir = tempdir().expect("can create temporary directory");
+    std::fs::write(tmp_dir.path().join("input.txt"), "hello\nworld\n")
+        .expect("can write temporary file");
+
+    bat()
+        .current_dir(tmp_dir.path())
+        .args(["-lbn", "input.txt"])
+        .assert()
+        .success()
+        .stdout("hello\nworld\n");
+}
+
+#[test]
+fn number_nonblank_style() {
+    bat()
+        .arg("empty_lines.txt")
+        .arg("-b")
+        .arg("--decorations=always")
+        .assert()
+        .success()
+        .stdout("   1 line 1\n     \n     \n     \n   2 line 5\n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n   3 line 20\n   4 line 21\n     \n     \n   5 line 24\n     \n   6 line 26\n     \n     \n     \n   7 line 30\n");
+}
+
+#[test]
+fn number_nonblank_from_cli_in_loop_through_mode() {
+    bat()
+        .arg("empty_lines.txt")
+        .arg("-b")
+        .assert()
+        .success()
+        .stdout("   1 line 1\n     \n     \n     \n   2 line 5\n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n   3 line 20\n   4 line 21\n     \n     \n   5 line 24\n     \n   6 line 26\n     \n     \n     \n   7 line 30\n");
+}
+
+#[test]
+fn number_nonblank_takes_precedence_over_number() {
+    // -bn should behave like -b
+    bat()
+        .arg("empty_lines.txt")
+        .arg("-bn")
+        .arg("--decorations=always")
+        .assert()
+        .success()
+        .stdout("   1 line 1\n     \n     \n     \n   2 line 5\n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n   3 line 20\n   4 line 21\n     \n     \n   5 line 24\n     \n   6 line 26\n     \n     \n     \n   7 line 30\n");
+
+    // -nb should also behave like -b
+    bat()
+        .arg("empty_lines.txt")
+        .arg("-nb")
+        .arg("--decorations=always")
+        .assert()
+        .success()
+        .stdout("   1 line 1\n     \n     \n     \n   2 line 5\n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n     \n   3 line 20\n   4 line 21\n     \n     \n   5 line 24\n     \n   6 line 26\n     \n     \n     \n   7 line 30\n");
+}
+
+#[test]
+fn number_nonblank_ignored_when_followed_by_plain() {
+    bat()
+        .arg("empty_lines.txt")
+        .arg("-bp")
+        .arg("--decorations=auto")
+        .assert()
+        .success()
+        .stdout("line 1\n\n\n\nline 5\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nline 20\nline 21\n\n\nline 24\n\nline 26\n\n\n\nline 30\n");
+}
+
+#[test]
+fn piped_output_with_number_nonblank_flag() {
+    bat()
+        .arg("-b")
+        .write_stdin("hello\n\nworld\n")
+        .assert()
+        .success()
+        .stdout("   1 hello\n     \n   2 world\n");
 }
 
 #[test]
@@ -174,6 +407,57 @@ fn line_range_2_3() {
         .assert()
         .success()
         .stdout("line 2\nline 3\n");
+}
+
+#[test]
+fn line_range_up_to_2_from_back() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=:-2")
+        .assert()
+        .success()
+        .stdout("line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n");
+}
+
+#[test]
+fn line_range_up_to_2_from_back_single_line_is_empty() {
+    bat()
+        .arg("single-line.txt")
+        .arg("--line-range=:-2")
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn line_range_from_back_last_two() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=-2:")
+        .assert()
+        .success()
+        .stdout("line 9\nline 10\n");
+}
+
+#[test]
+fn line_range_from_back_last_two_single_line_eq_sep() {
+    bat()
+        .arg("single-line.txt")
+        .arg("--line-range=-2:")
+        .assert()
+        .success()
+        .stdout("Single Line");
+}
+
+#[test]
+fn line_range_from_back_last_two_single_line_no_sep() {
+    bat()
+        .arg("single-line.txt")
+        .arg("--line-range")
+        .arg("-2:")
+        .assert()
+        .success()
+        .stdout("Single Line");
 }
 
 #[test]
@@ -190,10 +474,10 @@ fn line_range_first_two() {
 fn line_range_last_3() {
     bat()
         .arg("multiline.txt")
-        .arg("--line-range=2:")
+        .arg("--line-range=8:")
         .assert()
         .success()
-        .stdout("line 2\nline 3\nline 4\n");
+        .stdout("line 8\nline 9\nline 10\n");
 }
 
 #[test]
@@ -205,6 +489,244 @@ fn line_range_multiple() {
         .assert()
         .success()
         .stdout("line 1\nline 2\nline 4\n");
+}
+
+#[test]
+fn snip_at_terminal_width_one_does_not_panic() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--style=snip")
+        .arg("--color=always")
+        .arg("--terminal-width=1")
+        .arg("--line-range=1:2")
+        .arg("--line-range=4:4")
+        .assert()
+        .success();
+}
+
+#[test]
+fn line_range_multiple_with_context() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=2::1")
+        .arg("--line-range=8::1")
+        .assert()
+        .success()
+        .stdout("line 1\nline 2\nline 3\nline 7\nline 8\nline 9\n");
+}
+
+#[test]
+fn line_range_context_around_single_line() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=5::2")
+        .assert()
+        .success()
+        .stdout("line 3\nline 4\nline 5\nline 6\nline 7\n");
+}
+
+#[test]
+fn line_range_context_around_single_line_minimal() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=5::1")
+        .assert()
+        .success()
+        .stdout("line 4\nline 5\nline 6\n");
+}
+
+#[test]
+fn line_range_context_around_range() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=4:6:2")
+        .assert()
+        .success()
+        .stdout("line 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n");
+}
+
+#[test]
+fn line_range_context_at_file_boundaries() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=1::2")
+        .assert()
+        .success()
+        .stdout("line 1\nline 2\nline 3\n");
+}
+
+#[test]
+fn line_range_context_at_end_of_file() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=10::2")
+        .assert()
+        .success()
+        .stdout("line 8\nline 9\nline 10\n");
+}
+
+#[test]
+fn line_range_context_zero() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=5::0")
+        .assert()
+        .success()
+        .stdout("line 5\n");
+}
+
+#[test]
+fn line_range_context_negative_single_line() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=5::-1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Invalid context number in N::C format",
+        ));
+}
+
+#[test]
+fn line_range_context_negative_range() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=5:6:-1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Invalid context number in N:M:C format",
+        ));
+}
+
+#[test]
+fn line_range_context_non_numeric_single_line() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=10::abc")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Invalid context number in N::C format",
+        ));
+}
+
+#[test]
+fn line_range_context_non_numeric_range() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=10:12:xyz")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Invalid context number in N:M:C format",
+        ));
+}
+
+#[test]
+fn line_range_context_very_large() {
+    bat()
+        .arg("multiline.txt")
+        .arg("--line-range=10::999999")
+        .assert()
+        .success()
+        .stdout(
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n",
+        );
+}
+
+#[test]
+fn piped_output_with_implicit_auto_style() {
+    bat()
+        .write_stdin("hello\nworld\n")
+        .assert()
+        .success()
+        .stdout("hello\nworld\n");
+}
+
+#[test]
+fn piped_output_with_line_number_flag() {
+    bat()
+        .arg("--number")
+        .write_stdin("hello\nworld\n")
+        .assert()
+        .success()
+        .stdout("   1 hello\n   2 world\n");
+}
+
+#[test]
+fn piped_output_with_line_numbers_style_flag() {
+    bat()
+        .arg("--style=numbers")
+        .write_stdin("hello\nworld\n")
+        .assert()
+        .success()
+        .stdout("hello\nworld\n");
+}
+
+#[test]
+fn piped_output_with_line_numbers_with_header_grid_style_flag() {
+    // style ignored because non-interactive
+    bat()
+        .arg("--style=header,grid,numbers")
+        .write_stdin("hello\nworld\n")
+        .assert()
+        .success()
+        .stdout("hello\nworld\n");
+}
+
+#[test]
+fn piped_output_with_auto_style() {
+    bat()
+        .arg("--style=auto")
+        .write_stdin("hello\nworld\n")
+        .assert()
+        .success()
+        .stdout("hello\nworld\n"); // Should be plain when piped
+}
+
+#[test]
+#[cfg(not(target_os = "windows"))]
+fn piped_output_with_default_style_flag() {
+    bat()
+        .arg("--style=default")
+        .arg("--decorations=always")
+        .write_stdin("hello\nworld\n")
+        .assert()
+        .success()
+        .stdout(
+            "─────┬──────────────────────────────────────────────────────────────────────────
+     │ STDIN
+─────┼──────────────────────────────────────────────────────────────────────────
+   1 │ hello
+   2 │ world
+─────┴──────────────────────────────────────────────────────────────────────────
+",
+        );
+}
+
+#[test]
+fn repeated_boolean_flag_is_accepted() {
+    // A flag in the config file is prepended to the command line, so a user
+    // who has `--show-all` in their config and also types `-A` ends up passing
+    // it twice. That must not be an error.
+    bat()
+        .arg("empty_lines.txt")
+        .arg("--show-all")
+        .arg("--show-all")
+        .assert()
+        .success();
+}
+
+#[test]
+fn boolean_flag_in_config_and_on_command_line() {
+    bat_with_config()
+        .env("BAT_CONFIG_PATH", "bat-show-all.conf")
+        .arg("empty_lines.txt")
+        .arg("--show-all")
+        .arg("--paging=never")
+        .assert()
+        .success();
 }
 
 #[test]
@@ -314,6 +836,21 @@ fn list_themes_to_piped_output() {
 }
 
 #[test]
+#[serial]
+fn list_languages() {
+    mocked_pagers::with_mocked_versions_of_more_and_most_in_path(|| {
+        bat()
+            .env("PAGER", mocked_pagers::from("echo pager-output"))
+            .arg("--list-languages")
+            .arg("--paging=never")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Rust").normalize())
+            .stdout(predicate::str::contains("pager-output").not());
+    });
+}
+
+#[test]
 #[cfg_attr(
     any(not(feature = "git"), feature = "lessopen", target_os = "windows"),
     ignore
@@ -335,6 +872,44 @@ fn test_help(arg: &str, expect_file: &str) {
     let assert = bat().arg(arg).assert();
     expect_test::expect_file![expect_file]
         .assert_eq(&String::from_utf8_lossy(&assert.get_output().stdout));
+}
+
+#[test]
+fn short_help_with_highlighting() {
+    bat()
+        .arg("-h")
+        .arg("--paging=never")
+        .arg("--color=always")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\x1B["))
+        .stdout(predicate::str::contains("Usage:"))
+        .stdout(predicate::str::contains("Options:"));
+}
+
+#[test]
+fn long_help_with_highlighting() {
+    bat()
+        .arg("--help")
+        .arg("--paging=never")
+        .arg("--color=always")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\x1B["))
+        .stdout(predicate::str::contains("Usage:"))
+        .stdout(predicate::str::contains("Options:"));
+}
+
+#[test]
+fn help_with_color_never() {
+    bat()
+        .arg("--help")
+        .arg("--color=never")
+        .arg("--paging=never")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\x1B[").not())
+        .stdout(predicate::str::contains("Usage:"));
 }
 
 #[cfg(unix)]
@@ -408,6 +983,16 @@ fn stdin_to_stdout_cycle() -> io::Result<()> {
     drop(dir);
     res.failure();
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn bat_error_to_stderr() {
+    bat()
+        .arg("/tmp")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("[bat error]"));
 }
 
 #[cfg(unix)]
@@ -689,6 +1274,57 @@ fn tabs_4_arg_overrides_env_noconfig() {
 88888888    ?
 ",
         );
+}
+
+#[test]
+fn terminal_width_env_var_is_respected() {
+    let tmp_dir = tempdir().expect("can create temporary directory");
+    let tmp_path = tmp_dir.path().join("long.txt");
+    std::fs::write(
+        &tmp_path,
+        "0123456789abcdef0123456789abcdef0123456789abcdef\n",
+    )
+    .expect("can write temporary file");
+
+    bat()
+        .env("BAT_WIDTH", "20")
+        .arg(&tmp_path)
+        .arg("--paging=never")
+        .arg("--color=never")
+        .arg("--style=numbers")
+        .arg("--decorations=always")
+        .arg("--wrap=character")
+        .assert()
+        .success()
+        .stdout("   1 0123456789abcde\n     f0123456789abcd\n     ef0123456789abc\n     def\n")
+        .stderr("");
+}
+
+#[test]
+fn terminal_width_arg_overrides_env() {
+    let tmp_dir = tempdir().expect("can create temporary directory");
+    let tmp_path = tmp_dir.path().join("long.txt");
+    std::fs::write(
+        &tmp_path,
+        "0123456789abcdef0123456789abcdef0123456789abcdef\n",
+    )
+    .expect("can write temporary file");
+
+    bat()
+        .env("BAT_WIDTH", "20")
+        .arg(&tmp_path)
+        .arg("--paging=never")
+        .arg("--color=never")
+        .arg("--style=numbers")
+        .arg("--decorations=always")
+        .arg("--wrap=character")
+        .arg("--terminal-width=10")
+        .assert()
+        .success()
+        .stdout(
+            "   1 01234\n     56789\n     abcde\n     f0123\n     45678\n     9abcd\n     ef012\n     34567\n     89abc\n     def\n",
+        )
+        .stderr("");
 }
 
 #[test]
@@ -1001,27 +1637,33 @@ fn disable_pager_if_pp_flag_comes_after_paging() {
 }
 
 #[test]
+#[serial]
 fn enable_pager_if_disable_paging_flag_comes_before_paging() {
-    bat()
-        .env("PAGER", "echo pager-output")
-        .arg("-P")
-        .arg("--paging=always")
-        .arg("test.txt")
-        .assert()
-        .success()
-        .stdout(predicate::eq("pager-output\n").normalize());
+    mocked_pagers::with_mocked_versions_of_more_and_most_in_path(|| {
+        bat()
+            .env("PAGER", mocked_pagers::from("echo pager-output"))
+            .arg("-P")
+            .arg("--paging=always")
+            .arg("test.txt")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("pager-output\n").normalize());
+    });
 }
 
 #[test]
+#[serial]
 fn enable_pager_if_pp_flag_comes_before_paging() {
-    bat()
-        .env("PAGER", "echo pager-output")
-        .arg("-pp")
-        .arg("--paging=always")
-        .arg("test.txt")
-        .assert()
-        .success()
-        .stdout(predicate::eq("pager-output\n").normalize());
+    mocked_pagers::with_mocked_versions_of_more_and_most_in_path(|| {
+        bat()
+            .env("PAGER", mocked_pagers::from("echo pager-output"))
+            .arg("-pp")
+            .arg("--paging=always")
+            .arg("test.txt")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("pager-output\n").normalize());
+    });
 }
 
 #[test]
@@ -1038,15 +1680,18 @@ fn paging_does_not_override_simple_plain() {
 }
 
 #[test]
+#[serial]
 fn simple_plain_does_not_override_paging() {
-    bat()
-        .env("PAGER", "echo pager-output")
-        .arg("--paging=always")
-        .arg("--plain")
-        .arg("test.txt")
-        .assert()
-        .success()
-        .stdout(predicate::eq("pager-output\n"));
+    mocked_pagers::with_mocked_versions_of_more_and_most_in_path(|| {
+        bat()
+            .env("PAGER", mocked_pagers::from("echo pager-output"))
+            .arg("--paging=always")
+            .arg("--plain")
+            .arg("test.txt")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("pager-output\n").normalize());
+    });
 }
 
 #[test]
@@ -1058,6 +1703,21 @@ fn pager_failed_to_parse() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Could not parse pager command"));
+}
+
+#[test]
+#[serial]
+fn pager_missing_warning() {
+    bat()
+        .env("BAT_PAGER", "nonexistent-pager-xyz-missing")
+        .arg("--paging=always")
+        .arg("test.txt")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[bat warning]"))
+        .stderr(predicate::str::contains("not found"))
+        .stderr(predicate::str::contains("nonexistent-pager-xyz-missing"))
+        .stdout(predicate::str::contains("hello world\n"));
 }
 
 #[test]
@@ -1077,6 +1737,7 @@ fn env_var_bat_paging() {
 #[test]
 fn basic_set_terminal_title() {
     bat()
+        .env("BAT_PAGER", "cat")
         .arg("--paging=always")
         .arg("--set-terminal-title")
         .arg("test.txt")
@@ -1093,7 +1754,107 @@ fn diagnostic_sanity_check() {
         .assert()
         .success()
         .stdout(predicate::str::contains("BAT_PAGER="))
+        .stdout(predicate::str::contains("BAT_WIDTH="))
         .stderr("");
+}
+
+#[test]
+fn help_works_with_invalid_config() {
+    let tmp_dir = tempdir().expect("can create temporary directory");
+    let tmp_config_path = tmp_dir.path().join("invalid-config.conf");
+
+    // Write an invalid config file
+    std::fs::write(&tmp_config_path, "--invalid-option").expect("can write config file");
+
+    // --help should work despite invalid config
+    bat_with_config()
+        .env("BAT_CONFIG_PATH", tmp_config_path.to_str().unwrap())
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "A cat(1) clone with syntax highlighting",
+        ));
+
+    // -h should also work
+    bat_with_config()
+        .env("BAT_CONFIG_PATH", tmp_config_path.to_str().unwrap())
+        .arg("-h")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("A cat(1) clone with wings"));
+}
+
+#[test]
+fn help_uses_valid_config() {
+    let tmp_dir = tempdir().expect("can create temporary directory");
+    let tmp_config_path = tmp_dir.path().join("valid-config.conf");
+
+    // Write a valid config file with an invalid theme (so we can see a warning)
+    std::fs::write(&tmp_config_path, "--theme=NonExistentThemeName123")
+        .expect("can write config file");
+
+    // --help should read the config file and try to use the theme
+    // (we'll see a warning about unknown theme. This is the easiest way to prove the theme is read from config.)
+    bat_with_config()
+        .env("BAT_CONFIG_PATH", tmp_config_path.to_str().unwrap())
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "A cat(1) clone with syntax highlighting",
+        ))
+        .stderr(predicate::str::contains("Unknown theme"));
+}
+
+#[test]
+fn version_works_with_invalid_config() {
+    let tmp_dir = tempdir().expect("can create temporary directory");
+    let tmp_config_path = tmp_dir.path().join("invalid-config.conf");
+
+    // Write an invalid config file
+    std::fs::write(&tmp_config_path, "--invalid-option").expect("can write config file");
+
+    // --version should work despite invalid config
+    bat_with_config()
+        .env("BAT_CONFIG_PATH", tmp_config_path.to_str().unwrap())
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bat "));
+
+    // -V should also work
+    bat_with_config()
+        .env("BAT_CONFIG_PATH", tmp_config_path.to_str().unwrap())
+        .arg("-V")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bat "));
+}
+
+#[test]
+fn diagnostic_works_with_invalid_config() {
+    let tmp_dir = tempdir().expect("can create temporary directory");
+    let tmp_config_path = tmp_dir.path().join("invalid-config.conf");
+
+    // Write an invalid config file
+    std::fs::write(&tmp_config_path, "--invalid-option").expect("can write config file");
+
+    // --diagnostic should work despite invalid config
+    bat_with_config()
+        .env("BAT_CONFIG_PATH", tmp_config_path.to_str().unwrap())
+        .arg("--diagnostic")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#### Software version"));
+
+    // --diagnostics (alias) should also work
+    bat_with_config()
+        .env("BAT_CONFIG_PATH", tmp_config_path.to_str().unwrap())
+        .arg("--diagnostics")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#### Software version"));
 }
 
 #[test]
@@ -1206,7 +1967,7 @@ Clearing metadata file ... okay",
 
 #[cfg(unix)]
 #[test]
-fn cache_build() {
+fn cache_build_blank() {
     let src_dir = "cache_source";
     let tmp_dir = tempdir().expect("can create temporary directory");
     let tmp_themes_path = tmp_dir.path().join("themes.bin");
@@ -1249,6 +2010,50 @@ Writing metadata to folder .* ... okay",
     assert!(tmp_metadata_path.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn cache_build() {
+    let src_dir = "cache_source";
+    let tmp_dir = tempdir().expect("can create temporary directory");
+    let tmp_themes_path = tmp_dir.path().join("themes.bin");
+    let tmp_syntaxes_path = tmp_dir.path().join("syntaxes.bin");
+    let tmp_acknowledgements_path = tmp_dir.path().join("acknowledgements.bin");
+    let tmp_metadata_path = tmp_dir.path().join("metadata.yaml");
+
+    // Build the cache
+    // Include the BAT_CONFIG_PATH and BAT_THEME environment variables to ensure that
+    // options loaded from a config or the environment are not inserted
+    // before the cache subcommand, which would break it.
+    bat_with_config()
+        .current_dir(Path::new(EXAMPLES_DIR).join(src_dir))
+        .env("BAT_CONFIG_PATH", "bat.conf")
+        .env("BAT_THEME", "1337")
+        .arg("cache")
+        .arg("--build")
+        // removed --blank
+        .arg("--source")
+        .arg(".")
+        .arg("--target")
+        .arg(tmp_dir.path().to_str().unwrap())
+        .arg("--acknowledgements")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::is_match(
+                "Writing theme set to .*/themes.bin ... okay\nWriting syntax set to .*/syntaxes.bin ... okay\nWriting acknowledgements to .*/acknowledgements.bin ... okay\nWriting metadata to folder .* ... okay",
+            )
+            .unwrap(),
+        )
+        .stdout(predicate::str::contains("Some referenced contexts could not be found!").not())
+        ;
+
+    // Now we expect the files to exist. If they exist, we assume contents are correct
+    assert!(tmp_themes_path.exists());
+    assert!(tmp_syntaxes_path.exists());
+    assert!(tmp_acknowledgements_path.exists());
+    assert!(tmp_metadata_path.exists());
+}
+
 #[test]
 fn utf16() {
     // The output will be converted to UTF-8 with the leading UTF-16
@@ -1262,6 +2067,38 @@ fn utf16() {
         .assert()
         .success()
         .stdout("hello world\n");
+
+    bat()
+        .arg("--plain")
+        .arg("--decorations=always")
+        .arg("test_UTF-16BE.txt")
+        .assert()
+        .success()
+        .stdout("hello world\nthis is a test\n");
+}
+
+#[test]
+fn utf16le() {
+    bat()
+        .arg("--decorations=always")
+        .arg("--style=numbers")
+        .arg("--color=never")
+        .arg("test_UTF-16LE-complicated.txt")
+        .assert()
+        .success()
+        .stdout("   1 上一伊刀\n   2 foo bar\n   3 hello world\n");
+}
+
+#[test]
+fn utf16be() {
+    bat()
+        .arg("--decorations=always")
+        .arg("--style=numbers")
+        .arg("--color=never")
+        .arg("test_UTF-16BE-complicated.txt")
+        .assert()
+        .success()
+        .stdout("   1 上一伊刀\n   2 foo bar\n   3 hello world\n");
 }
 
 // Regression test for https://github.com/sharkdp/bat/issues/1922
@@ -1432,6 +2269,12 @@ fn snip() {
    2 line 2
  ...─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ 8< ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
    4 line 4
+   5 line 5
+   6 line 6
+   7 line 7
+   8 line 8
+   9 line 9
+  10 line 10
 ",
         );
 }
@@ -1531,6 +2374,44 @@ fn header_binary() {
         .stderr("");
 }
 
+// Regression test for https://github.com/sharkdp/bat/issues/3554
+#[test]
+fn header_binary_with_null_after_first_line() {
+    let tmp_dir = tempdir().expect("can create temporary directory");
+    let tmp_path = tmp_dir.path().join("encrypted.gpg");
+    std::fs::write(&tmp_path, b"packet-header\npayload\0bytes\n")
+        .expect("can write temporary file");
+
+    bat()
+        .arg(&tmp_path)
+        .arg("--decorations=always")
+        .arg("--style=header")
+        .arg("--line-range=0:0")
+        .arg("--file-name=encrypted.gpg")
+        .assert()
+        .success()
+        .stdout("File: encrypted.gpg   <BINARY>\n")
+        .stderr("");
+}
+
+#[test]
+fn header_zip_file_is_binary() {
+    let tmp_dir = tempdir().expect("can create temporary directory");
+    let tmp_path = tmp_dir.path().join("test.zip");
+    std::fs::write(&tmp_path, b"PK\x03\x04hello").expect("can write temporary file");
+
+    bat()
+        .arg(&tmp_path)
+        .arg("--decorations=always")
+        .arg("--style=header")
+        .arg("-r=0:0")
+        .arg("--file-name=test.zip")
+        .assert()
+        .success()
+        .stdout("File: test.zip   <BINARY>\n")
+        .stderr("");
+}
+
 #[test]
 fn header_full_binary() {
     bat()
@@ -1601,6 +2482,17 @@ oken
 }
 
 #[test]
+fn header_narrow_terminal_with_multibyte_chars() {
+    bat()
+        .arg("--terminal-width=30")
+        .arg("--decorations=always")
+        .arg("test.A—B가")
+        .assert()
+        .success()
+        .stderr("");
+}
+
+#[test]
 #[cfg(feature = "git")] // Expected output assumes git is enabled
 fn header_default() {
     bat()
@@ -1615,11 +2507,11 @@ fn header_default() {
         .success()
         .stdout(
             "\
-───────┬────────────────────────────────────────────────────────────────────────
-       │ File: single-line.txt
-───────┼────────────────────────────────────────────────────────────────────────
-   1   │ Single Line
-───────┴────────────────────────────────────────────────────────────────────────
+─────┬──────────────────────────────────────────────────────────────────────────
+     │ File: single-line.txt
+─────┼──────────────────────────────────────────────────────────────────────────
+   1 │ Single Line
+─────┴──────────────────────────────────────────────────────────────────────────
 ",
         )
         .stderr("");
@@ -1639,13 +2531,28 @@ fn header_default_is_default() {
         .success()
         .stdout(
             "\
-───────┬────────────────────────────────────────────────────────────────────────
-       │ File: single-line.txt
-───────┼────────────────────────────────────────────────────────────────────────
-   1   │ Single Line
-───────┴────────────────────────────────────────────────────────────────────────
+─────┬──────────────────────────────────────────────────────────────────────────
+     │ File: single-line.txt
+─────┼──────────────────────────────────────────────────────────────────────────
+   1 │ Single Line
+─────┴──────────────────────────────────────────────────────────────────────────
 ",
         )
+        .stderr("");
+}
+
+#[test]
+#[cfg(feature = "git")] // Expected output assumes git is enabled
+                        // Make sure indent isn't printed if there's no changes
+fn header_and_changes_only() {
+    bat()
+        .arg("--style=header-filename,changes")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("single-line.txt")
+        .assert()
+        .success()
+        .stdout("File: single-line.txt\nSingle Line\n")
         .stderr("");
 }
 
@@ -1883,6 +2790,260 @@ fn no_first_line_fallback_when_mapping_to_invalid_syntax() {
 }
 
 #[test]
+fn stdin_detects_bash_from_first_line() {
+    let content = "#!/bin/bash\necho hi\n";
+
+    let detected_output = bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let explicit_output = bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--language=bash")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        from_utf8(&detected_output).expect("output is valid utf-8"),
+        from_utf8(&explicit_output).expect("output is valid utf-8")
+    );
+}
+
+#[test]
+fn stdin_detects_diff_from_first_line() {
+    let content = "diff --git a/x b/y\n--- a/x\n+++ b/y\n@@ -1 +1 @@\n-old\n+new\n";
+
+    let detected_output = bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let explicit_output = bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--language=diff")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        from_utf8(&detected_output).expect("output is valid utf-8"),
+        from_utf8(&explicit_output).expect("output is valid utf-8")
+    );
+}
+
+#[test]
+fn empty_stdin_does_not_detect_syntax() {
+    bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+}
+
+#[test]
+fn binary_stdin_does_not_detect_syntax_from_invalid_utf8_first_line() {
+    let content = b"#!/bin/bash\xff\necho hi\n";
+
+    let detected_output = bat()
+        .arg("--binary=as-text")
+        .arg("--color=always")
+        .arg("--style=plain")
+        .write_stdin(content.as_slice())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let plain_text_output = bat()
+        .arg("--binary=as-text")
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--language=txt")
+        .write_stdin(content.as_slice())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        from_utf8(&detected_output).expect("output is valid utf-8"),
+        from_utf8(&plain_text_output).expect("output is valid utf-8")
+    );
+}
+
+#[test]
+fn explicit_language_overrides_stdin_first_line_detection() {
+    let content = "diff --git a/x b/y\n--- a/x\n+++ b/y\n@@ -1 +1 @@\n-old\n+new\n";
+
+    let detected_output = bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let explicit_output = bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--language=json")
+        .arg("-")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_ne!(
+        from_utf8(&detected_output).expect("output is valid utf-8"),
+        from_utf8(&explicit_output).expect("output is valid utf-8")
+    );
+}
+
+#[test]
+fn fallback_syntax_is_used_when_no_syntax_is_detected() {
+    let content = "# comment\nfoo=bar\n";
+
+    let fallback_output = bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--file-name=unknown.fallbacksyntax")
+        .arg("--fallback-syntax=bash")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let explicit_output = bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--language=bash")
+        .arg("--file-name=unknown.fallbacksyntax")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        from_utf8(&fallback_output).expect("output is valid utf-8"),
+        from_utf8(&explicit_output).expect("output is valid utf-8")
+    );
+}
+
+#[test]
+fn fallback_syntax_does_not_override_detected_syntax() {
+    let content = "fn main() { println!(\"hello\"); }\n";
+
+    let with_fallback = bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--file-name=test.rs")
+        .arg("--fallback-syntax=json")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let without_fallback = bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--file-name=test.rs")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        from_utf8(&with_fallback).expect("output is valid utf-8"),
+        from_utf8(&without_fallback).expect("output is valid utf-8")
+    );
+}
+
+#[test]
+fn fallback_syntax_does_not_override_explicit_language() {
+    let content = "{\"a\": 1}\n";
+
+    let with_fallback = bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--language=json")
+        .arg("--fallback-syntax=rust")
+        .arg("--file-name=unknown.fallbacksyntax")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let without_fallback = bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--language=json")
+        .arg("--file-name=unknown.fallbacksyntax")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        from_utf8(&with_fallback).expect("output is valid utf-8"),
+        from_utf8(&without_fallback).expect("output is valid utf-8")
+    );
+}
+
+#[test]
+fn invalid_fallback_syntax_returns_error() {
+    bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--file-name=unknown.fallbacksyntax")
+        .arg("--fallback-syntax=InvalidSyntax")
+        .write_stdin("foo\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown syntax: 'InvalidSyntax'"));
+}
+
+#[test]
 fn show_all_mode() {
     bat()
         .arg("--show-all")
@@ -1979,6 +3140,92 @@ fn binary_as_text() {
 }
 
 #[test]
+fn binary_as_text_control_char_width() {
+    // Control characters are displayed as caret notation (e.g. ^@) by the
+    // terminal, occupying 2 columns each. With 20 NUL bytes (40 columns) +
+    // "END" (3 columns) = 43 columns, wrapping at terminal width 40 must
+    // produce 2 lines, not 1. See #3631.
+    bat()
+        .arg("--binary=as-text")
+        .arg("--wrap=character")
+        .arg("--terminal-width=40")
+        .arg("--decorations=always")
+        .arg("--style=plain")
+        .arg("--color=never")
+        .arg("regression_tests/issue_3631.txt")
+        .assert()
+        .success()
+        .stdout(predicate::function(|s: &str| s.lines().count() == 2));
+}
+
+#[test]
+fn no_strip_overstrike_for_plain_text() {
+    // Overstrike is preserved for plain text files (no syntax highlighting)
+    bat()
+        .arg("--color=never")
+        .arg("--decorations=never")
+        .arg("overstrike.txt")
+        .assert()
+        .success()
+        .stdout("B\x08Bold t\x08te\x08ex\x08xt\x08t and _\x08u_\x08n_\x08d_\x08e_\x08r_\x08l_\x08i_\x08n_\x08e\n")
+        .stderr("");
+}
+
+#[test]
+fn strip_overstrike_with_syntax_highlighting() {
+    // Overstrike is stripped for certain syntax highlighting like command help.
+    bat()
+        .arg("--force-colorization")
+        .arg("--language=help")
+        .arg("overstrike.txt")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Bold text and underline"))
+        .stderr("");
+}
+
+#[test]
+fn strip_overstrike_for_manpage_syntax() {
+    // Overstrike is stripped for .man files (Manpage syntax)
+    bat()
+        .arg("--force-colorization")
+        .arg("git-commit.man")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("NAME"))
+        .stdout(predicate::str::contains("git-commit - Record changes"))
+        .stdout(predicate::str::is_match(r"\x1b\[38;[0-9;]+m--interactive\x1b\[").unwrap())
+        .stderr("");
+}
+
+#[test]
+fn no_strip_overstrike_for_other_syntax() {
+    // Overstrike is NOT stripped for other syntaxes (e.g., Rust)
+    bat()
+        .arg("--force-colorization")
+        .arg("--language=rust")
+        .arg("overstrike.txt")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\x08"))
+        .stderr("");
+}
+
+#[test]
+fn show_all_shows_backspace_with_caret_notation() {
+    // --show-all should display backspace characters (not strip them)
+    bat()
+        .arg("--show-all")
+        .arg("--nonprintable-notation=caret")
+        .arg("--decorations=never")
+        .arg("overstrike.txt")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("^H"))
+        .stderr("");
+}
+
+#[test]
 fn no_paging_arg() {
     bat()
         .arg("--no-paging")
@@ -2043,12 +3290,12 @@ fn grid_for_file_without_newline() {
         .success()
         .stdout(
             "\
-───────┬────────────────────────────────────────────────────────────────────────
-       │ File: single-line.txt
-       │ Size: 11 B
-───────┼────────────────────────────────────────────────────────────────────────
-   1   │ Single Line
-───────┴────────────────────────────────────────────────────────────────────────
+─────┬──────────────────────────────────────────────────────────────────────────
+     │ File: single-line.txt
+     │ Size: 11 B
+─────┼──────────────────────────────────────────────────────────────────────────
+   1 │ Single Line
+─────┴──────────────────────────────────────────────────────────────────────────
 ",
         )
         .stderr("");
@@ -2070,6 +3317,24 @@ fn ansi_highlight_underline() {
         .assert()
         .success()
         .stdout("\x1B[4mAnsi Underscore Test\n\x1B[24mAnother Line")
+        .stderr("");
+}
+
+// we don't really test other color schemes in the syntax-tests/source vs highlighted stuff
+// so here a simple integration test has been made for the ANSI theme,
+// which lives directly inside the bat repository
+#[test]
+fn ansi_highlight_json_keys() {
+    bat()
+        .arg("--paging=never")
+        .arg("--color=always")
+        .arg("--decorations=never")
+        .arg("--theme=ansi")
+        .arg("--language=json")
+        .write_stdin("{\"foo\": \"bar\", \"test\": [123, \"baz\"] }")
+        .assert()
+        .success()
+        .stdout("{\x1B[33m\"\x1B[0m\x1B[33mfoo\x1B[0m\x1B[33m\"\x1B[0m: \x1B[38;5;13m\"\x1B[0m\x1B[38;5;13mbar\x1B[0m\x1B[38;5;13m\"\x1B[0m, \x1B[33m\"\x1B[0m\x1B[33mtest\x1B[0m\x1B[33m\"\x1B[0m: [\x1B[31m123\x1B[0m, \x1B[38;5;13m\"\x1B[0m\x1B[38;5;13mbaz\x1B[0m\x1B[38;5;13m\"\x1B[0m] }")
         .stderr("");
 }
 
@@ -2145,6 +3410,25 @@ fn ansi_sgr_joins_attributes_when_wrapped() {
             .assert()
             .success()
             .stdout("\x1B[33m\x1B[33mColor. \x1B[1m\x1B[33m\x1B[1mBold.........\n\x1B[33m\x1B[1mAlso bold and color.\n")
+            // FIXME:              ~~~~~~~~       ~~~~~~~~~~~~~~~ should not be emitted twice.
+            .stderr("");
+}
+
+// Ensure that strikethrough (SGR 9) is tracked like the other attributes, so it is
+// re-emitted (and therefore preserved) across a wrap boundary instead of being dropped.
+#[test]
+fn ansi_sgr_strike_joins_attributes_when_wrapped() {
+    bat()
+            .arg("--paging=never")
+            .arg("--color=never")
+            .arg("--terminal-width=20")
+            .arg("--wrap=character")
+            .arg("--decorations=always")
+            .arg("--style=plain")
+            .write_stdin("\x1B[33mColor. \x1B[9mStrike.......Struck+color.\n")
+            .assert()
+            .success()
+            .stdout("\x1B[33m\x1B[33mColor. \x1B[9m\x1B[33m\x1B[9mStrike.......\n\x1B[33m\x1B[9mStruck+color.\n")
             // FIXME:              ~~~~~~~~       ~~~~~~~~~~~~~~~ should not be emitted twice.
             .stderr("");
 }
@@ -2225,6 +3509,44 @@ fn no_line_wrapping_with_s_flag() {
 #[test]
 fn no_wrapping_with_chop_long_lines() {
     wrapping_test("--chop-long-lines", false);
+}
+
+#[test]
+#[serial]
+fn wrap_never_flag_respected_with_paging_always() {
+    mocked_pagers::with_mocked_versions_of_more_and_most_in_path(|| {
+        bat()
+            .arg("--pager=cat")
+            .arg("--paging=always")
+            .arg("--wrap=never")
+            .arg("--color=never")
+            .arg("--decorations=never")
+            .arg("--style=plain")
+            .write_stdin("abcdefghigklmnopqrstuvxyzabcdefghigklmnopqrstuvxyzabcdefghigklmnopqrstuvxyzabcdefghigklmnopqrstuvxyz\n")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("abcdefghigklmnopqrstuvxyzabcdefghigklmnopqrstuvxyzabcdefghigklmnopqrstuvxyzabcdefghigklmnopqrstuvxyz").normalize())
+            .stderr("");
+    });
+}
+
+#[test]
+#[serial]
+fn s_flag_respected_with_paging_always() {
+    mocked_pagers::with_mocked_versions_of_more_and_most_in_path(|| {
+        bat()
+            .arg("--pager=cat")
+            .arg("--paging=always")
+            .arg("-S")
+            .arg("--color=never")
+            .arg("--decorations=never")
+            .arg("--style=plain")
+            .write_stdin("abcdefghigklmnopqrstuvxyzabcdefghigklmnopqrstuvxyzabcdefghigklmnopqrstuvxyzabcdefghigklmnopqrstuvxyz\n")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("abcdefghigklmnopqrstuvxyzabcdefghigklmnopqrstuvxyzabcdefghigklmnopqrstuvxyzabcdefghigklmnopqrstuvxyz").normalize())
+            .stderr("");
+    });
 }
 
 #[test]
@@ -2752,6 +4074,27 @@ fn highlighting_independant_from_map_syntax_case() {
 }
 
 #[test]
+fn map_syntax_target_syntax_case_insensitive() {
+    let expected = bat()
+        .arg("-f")
+        .arg("--map-syntax=*.config:json")
+        .arg("map-syntax_case.Config")
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+
+    bat()
+        .arg("-f")
+        .arg("--map-syntax=*.config:json")
+        .arg("map-syntax_case.Config")
+        .assert()
+        .success()
+        .stdout(expected)
+        .stderr("");
+}
+
+#[test]
 fn strip_ansi_always_strips_ansi() {
     bat()
         .arg("--style=plain")
@@ -2895,6 +4238,158 @@ fn strip_ansi_auto_does_not_strip_ansi_when_plain_text_by_option() {
     assert!(output.contains("\x1B[33mYellow"))
 }
 
+#[test]
+fn sanitize_implies_strip_ansi() {
+    bat()
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("--sanitize=always")
+        .write_stdin("\x1B[33mYellow\x1B[m")
+        .assert()
+        .success()
+        .stdout("Yellow");
+}
+
+#[test]
+fn sanitize_strips_osc_clipboard_hijack() {
+    // OSC 52 sets the system clipboard. A file containing this would silently
+    // overwrite the user's clipboard if displayed unfiltered.
+    bat()
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("--sanitize=always")
+        .write_stdin("safe\x1B]52;c;cm0=\x07payload")
+        .assert()
+        .success()
+        .stdout("safepayload");
+}
+
+#[test]
+fn sanitize_strips_osc_8_hyperlink_spoof() {
+    // OSC 8 hyperlinks let displayed text point to an arbitrary URL.
+    bat()
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("--sanitize=always")
+        .write_stdin("\x1B]8;;https://evil.example\x07click here\x1B]8;;\x07")
+        .assert()
+        .success()
+        .stdout("click here");
+}
+
+#[test]
+fn sanitize_strips_window_title_injection() {
+    // OSC 0/1/2 set the terminal window title.
+    bat()
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("--sanitize=always")
+        .write_stdin("hello\x1B]0;evil-title\x07world")
+        .assert()
+        .success()
+        .stdout("helloworld");
+}
+
+#[test]
+fn sanitize_strips_8bit_csi() {
+    // 8-bit CSI introducer (U+009B) is the single-codepoint equivalent of ESC [.
+    bat()
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("--sanitize=always")
+        .write_stdin("a\u{9B}31mRED\u{9B}0mb")
+        .assert()
+        .success()
+        .stdout("aREDb");
+}
+
+#[test]
+fn sanitize_substitutes_bare_cr() {
+    // Bare CR (not part of CRLF) is the line-overwrite forgery vector.
+    bat()
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("--sanitize=always")
+        .write_stdin("safe\rEVIL")
+        .assert()
+        .success()
+        .stdout("safe\u{FFFD}EVIL");
+}
+
+#[test]
+fn sanitize_preserves_crlf() {
+    bat()
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("--sanitize=always")
+        .write_stdin("line1\r\nline2\r\n")
+        .assert()
+        .success()
+        .stdout("line1\r\nline2\r\n");
+}
+
+#[test]
+fn sanitize_substitutes_bidi_controls() {
+    // Trojan-Source attack (CVE-2021-42574): U+202E (RLO) reorders display.
+    bat()
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("--sanitize=always")
+        .write_stdin("admin\u{202E}check")
+        .assert()
+        .success()
+        .stdout("admin\u{FFFD}check");
+}
+
+#[test]
+fn sanitize_substitutes_zero_width() {
+    // Zero-width chars allow invisible content / identifier confusion.
+    bat()
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("--sanitize=always")
+        .write_stdin("ad\u{200B}min")
+        .assert()
+        .success()
+        .stdout("ad\u{FFFD}min");
+}
+
+#[test]
+fn sanitize_preserves_form_feed_in_source() {
+    // FF (U+000C) is used as a section separator in C source and Emacs Lisp.
+    bat()
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("--sanitize=always")
+        .write_stdin("section1\x0Csection2")
+        .assert()
+        .success()
+        .stdout("section1\x0Csection2");
+}
+
+#[test]
+fn sanitize_preserves_unicode_text() {
+    bat()
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("--sanitize=always")
+        .write_stdin("snowman ☃ CJK 漢字 emoji 🦀")
+        .assert()
+        .success()
+        .stdout("snowman ☃ CJK 漢字 emoji 🦀");
+}
+
 // Tests that style components can be removed with `-component`.
 #[test]
 fn style_components_can_be_removed() {
@@ -2961,4 +4456,375 @@ fn style_components_will_merge_with_env_var() {
         .success()
         .stdout("     STDIN\n   1 test\n")
         .stderr("");
+}
+
+// Test for https://github.com/sharkdp/bat/issues/3526
+#[test]
+fn plain_with_sized_terminal_width() {
+    bat()
+        .arg("--plain")
+        .arg("--terminal-width=6")
+        .arg("--decorations=always")
+        .arg("test.txt")
+        .assert()
+        .success()
+        .stdout("hello \nworld\n")
+        .stderr("");
+}
+
+#[test]
+fn quiet_empty_suppresses_output_on_empty_stdin() {
+    bat()
+        .arg("--quiet-empty")
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn quiet_empty_does_not_affect_non_empty_input() {
+    bat()
+        .arg("--quiet-empty")
+        .write_stdin("hello\n")
+        .assert()
+        .success()
+        .stdout("hello\n");
+}
+
+#[test]
+fn quiet_empty_suppresses_output_on_empty_file() {
+    bat()
+        .arg("--quiet-empty")
+        .arg("empty.txt")
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn cache_help_shows_help_message() {
+    // Test that `bat cache --help` works (fixes #3560)
+    // Run in cache_source directory which doesn't have a file named "cache"
+    bat_with_config()
+        .current_dir(Path::new(EXAMPLES_DIR).join("cache_source"))
+        .arg("cache")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Modify the syntax-definition and theme cache",
+        ))
+        .stdout(predicate::str::contains("--build"))
+        .stdout(predicate::str::contains("--clear"));
+}
+
+#[test]
+fn unbuffered_flag_is_accepted() {
+    bat()
+        .arg("--unbuffered")
+        .arg("test.txt")
+        .assert()
+        .success()
+        .stdout("hello world\n");
+}
+
+#[test]
+fn unbuffered_mode_disables_line_numbers() {
+    // When --unbuffered is used, line numbers should be auto-disabled even if requested
+    bat()
+        .arg("--unbuffered")
+        .arg("--style=numbers")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("test.txt")
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("   1").not());
+}
+
+#[test]
+fn unbuffered_mode_plain_output() {
+    bat()
+        .arg("--unbuffered")
+        .arg("--color=never")
+        .arg("--decorations=never")
+        .arg("test.txt")
+        .assert()
+        .success()
+        .stdout("hello world\n");
+}
+
+#[test]
+fn word_wrap_breaks_at_word_boundaries() {
+    bat()
+        .arg("word-wrap.txt")
+        .arg("--wrap=word")
+        .arg("--terminal-width=40")
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .assert()
+        .success()
+        .stdout(
+            "\
+The quick brown fox jumps over the lazy
+dog and then runs away
+superlongwordthatdefinitelyexceedstheter
+minalwidthandshouldfallbacktocharacterwr
+apping
+short words here
+",
+        );
+}
+
+#[test]
+fn word_wrap_with_line_numbers() {
+    bat()
+        .arg("word-wrap.txt")
+        .arg("--wrap=word")
+        .arg("--terminal-width=40")
+        .arg("--style=numbers")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .assert()
+        .success()
+        .stdout(
+            "   1 The quick brown fox jumps over the
+     lazy dog and then runs away
+   2 superlongwordthatdefinitelyexceedst
+     heterminalwidthandshouldfallbacktoc
+     haracterwrapping
+   3 short words here
+",
+        );
+}
+
+#[test]
+fn word_wrap_short_line_no_wrap() {
+    bat()
+        .arg("--wrap=word")
+        .arg("--terminal-width=80")
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("--color=never")
+        .arg("single-line.txt")
+        .assert()
+        .success()
+        .stdout("Single Line\n");
+}
+
+#[cfg(unix)]
+#[cfg(feature = "git")]
+fn setup_diff_test_repo() -> tempfile::TempDir {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().expect("can create temporary directory");
+    let repo = dir.path();
+
+    // Initialize a git repo and commit a file
+    Command::new("git")
+        .args(["init"])
+        .current_dir(repo)
+        .output()
+        .expect("git init");
+
+    Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(repo)
+        .output()
+        .expect("git config email");
+
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(repo)
+        .output()
+        .expect("git config name");
+
+    std::fs::write(repo.join("test.txt"), "line 1\nline 2\nline 3\n").expect("can write test file");
+
+    Command::new("git")
+        .args(["add", "test.txt"])
+        .current_dir(repo)
+        .output()
+        .expect("git add");
+
+    Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(repo)
+        .output()
+        .expect("git commit");
+
+    // Modify the file so --diff has something to show
+    std::fs::write(
+        repo.join("test.txt"),
+        "line 1\nline 2 modified\nline 3\nline 4 added\n",
+    )
+    .expect("can write modified test file");
+
+    dir
+}
+
+#[cfg(unix)]
+#[cfg(feature = "git")]
+#[test]
+fn diff_plain_preserves_change_markers() {
+    let repo = setup_diff_test_repo();
+
+    // With --diff --plain, output should contain the change marker column
+    // but not other decorations like line numbers or grid
+    let output = bat()
+        .current_dir(repo.path())
+        .arg("--diff")
+        .arg("--plain")
+        .arg("--color=never")
+        .arg("--decorations=always")
+        .arg("test.txt")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = std::str::from_utf8(&output).expect("valid utf-8");
+
+    // The output should contain the modified and added lines
+    assert!(
+        stdout.contains("line 2 modified"),
+        "diff plain output should contain modified line, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("line 4 added"),
+        "diff plain output should contain added line, got: {stdout}"
+    );
+
+    // Should NOT contain line numbers (a decoration that --plain disables)
+    assert!(
+        !stdout.contains("   1"),
+        "diff plain output should not contain line numbers, got: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[cfg(feature = "git")]
+#[test]
+fn diff_plain_does_not_show_grid_or_header() {
+    let repo = setup_diff_test_repo();
+
+    let output = bat()
+        .current_dir(repo.path())
+        .arg("--diff")
+        .arg("--plain")
+        .arg("--color=never")
+        .arg("--decorations=always")
+        .arg("--terminal-width=80")
+        .arg("test.txt")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = std::str::from_utf8(&output).expect("valid utf-8");
+
+    // Grid lines use box-drawing characters
+    assert!(
+        !stdout.contains('─'),
+        "diff plain output should not contain grid lines, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains('│'),
+        "diff plain output should not contain grid separators, got: {stdout}"
+    );
+
+    // Header shows "File: <filename>"
+    assert!(
+        !stdout.contains("File:"),
+        "diff plain output should not contain file header, got: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[cfg(feature = "git")]
+#[test]
+fn plain_without_diff_still_works() {
+    let repo = setup_diff_test_repo();
+
+    // --plain without --diff should output file content with no decorations at all
+    bat()
+        .current_dir(repo.path())
+        .arg("--plain")
+        .arg("--color=never")
+        .arg("--decorations=always")
+        .arg("test.txt")
+        .assert()
+        .success()
+        .stdout("line 1\nline 2 modified\nline 3\nline 4 added\n");
+}
+
+#[test]
+fn tcl_shebang_detection_tclsh() {
+    bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("regression_tests/issue_3647_tclsh")
+        .assert()
+        .success();
+}
+
+#[test]
+fn tcl_shebang_detection_wish() {
+    bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("regression_tests/issue_3647_wish")
+        .assert()
+        .success();
+}
+
+#[test]
+fn tcl_shebang_detection_expect() {
+    bat()
+        .arg("--color=always")
+        .arg("--style=plain")
+        .arg("--decorations=always")
+        .arg("regression_tests/issue_3647_expect")
+        .assert()
+        .success();
+}
+
+#[test]
+fn ignored_suffix_enables_first_line_detection() {
+    // A shebang shell script saved with a `.txt` extension is Plain Text by
+    // default (the extension wins). With `--ignored-suffix .txt` the suffix is
+    // stripped before detection, so it falls back to the first line and is
+    // highlighted exactly as if its language were forced to bash. See #2745.
+    let fixture = "regression_tests/issue_2745.txt";
+    let common = ["--color=always", "--decorations=never", "--style=plain"];
+
+    let stdout = |args: &[&str]| -> Vec<u8> {
+        let assert = bat()
+            .args(common)
+            .args(args)
+            .arg(fixture)
+            .assert()
+            .success();
+        assert.get_output().stdout.clone()
+    };
+
+    let forced_bash = stdout(&["--language", "bash"]);
+    let with_ignored_suffix = stdout(&["--ignored-suffix", ".txt"]);
+    let default = stdout(&[]);
+
+    // The fixture really is being highlighted (forcing bash is not a no-op).
+    assert!(
+        forced_bash.windows(2).any(|w| w == b"\x1b["),
+        "forced-bash output should contain ANSI color codes"
+    );
+    // With the ignored suffix, detection matches forced bash highlighting...
+    assert_eq!(with_ignored_suffix, forced_bash);
+    // ...while the default (extension wins) stays plain and differs.
+    assert_ne!(default, forced_bash);
 }

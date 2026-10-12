@@ -152,18 +152,20 @@ impl HighlightingAssets {
         &self,
         path: impl AsRef<Path>,
         mapping: &SyntaxMapping,
-    ) -> Result<SyntaxReferenceInSet> {
+    ) -> Result<SyntaxReferenceInSet<'_>> {
         let path = path.as_ref();
 
         let syntax_match = mapping.get_syntax_for(path);
 
         if let Some(MappingTarget::MapToUnknown) = syntax_match {
-            return Err(Error::UndetectedSyntax(path.to_string_lossy().into()));
+            return Err(Error::UndetectedSyntax(
+                crate::preprocessor::sanitize_for_terminal(&path.to_string_lossy()),
+            ));
         }
 
         if let Some(MappingTarget::MapTo(syntax_name)) = syntax_match {
             return self
-                .find_syntax_by_name(syntax_name)?
+                .find_syntax_by_token(syntax_name)?
                 .ok_or_else(|| Error::UnknownSyntax(syntax_name.to_owned()));
         }
 
@@ -175,13 +177,17 @@ impl HighlightingAssets {
         ) {
             (Some(syntax), _) => Ok(syntax),
 
-            (_, Some(MappingTarget::MapExtensionToUnknown)) => {
-                Err(Error::UndetectedSyntax(path.to_string_lossy().into()))
-            }
+            (_, Some(MappingTarget::MapExtensionToUnknown)) => Err(Error::UndetectedSyntax(
+                crate::preprocessor::sanitize_for_terminal(&path.to_string_lossy()),
+            )),
 
             _ => self
                 .get_syntax_for_file_extension(file_name, &mapping.ignored_suffixes)?
-                .ok_or_else(|| Error::UndetectedSyntax(path.to_string_lossy().into())),
+                .ok_or_else(|| {
+                    Error::UndetectedSyntax(crate::preprocessor::sanitize_for_terminal(
+                        &path.to_string_lossy(),
+                    ))
+                }),
         }
     }
 
@@ -191,11 +197,11 @@ impl HighlightingAssets {
             Some(theme) => theme,
             None => {
                 if theme == "ansi-light" || theme == "ansi-dark" {
-                    bat_warning!("Theme '{}' is deprecated, using 'ansi' instead.", theme);
+                    bat_warning!("Theme '{theme}' is deprecated, using 'ansi' instead.");
                     return self.get_theme("ansi");
                 }
                 if !theme.is_empty() {
-                    bat_warning!("Unknown theme '{}', using default.", theme)
+                    bat_warning!("Unknown theme '{theme}', using default.")
                 }
                 self.get_theme_set()
                     .get(
@@ -210,9 +216,10 @@ impl HighlightingAssets {
     pub(crate) fn get_syntax(
         &self,
         language: Option<&str>,
+        fallback_syntax: Option<&str>,
         input: &mut OpenedInput,
         mapping: &SyntaxMapping,
-    ) -> Result<SyntaxReferenceInSet> {
+    ) -> Result<SyntaxReferenceInSet<'_>> {
         if let Some(language) = language {
             let syntax_set = self.get_syntax_set()?;
             return syntax_set
@@ -222,21 +229,50 @@ impl HighlightingAssets {
         }
 
         let path = input.path();
-        let path_syntax = if let Some(path) = path {
-            self.get_syntax_for_path(
-                PathAbs::new(path).map_or_else(|_| path.to_owned(), |p| p.as_path().to_path_buf()),
-                mapping,
-            )
+        let absolute_path = path.and_then(|p| {
+            PathAbs::new(p)
+                .ok()
+                .map(|abs| abs.as_path().to_path_buf())
+                .or_else(|| Some(p.to_owned()))
+        });
+
+        let path_syntax = if let Some(ref path) = absolute_path {
+            self.get_syntax_for_path(path, mapping).or_else(|e| {
+                // If syntax detection failed on the given path, retry with the
+                // canonicalized path (which resolves symlinks). This handles
+                // cases like `Aliases/0install -> ../Formula/zero-install.rb`
+                // where the symlink name has no extension but the target does.
+                // See #1001.
+                if matches!(e, Error::UndetectedSyntax(_)) {
+                    if let Ok(resolved) = fs::canonicalize(path) {
+                        if resolved != *path {
+                            return match self.get_syntax_for_path(&resolved, mapping) {
+                                Ok(syntax) => Ok(syntax),
+                                Err(Error::UndetectedSyntax(_)) => Err(e),
+                                Err(err) => Err(err),
+                            };
+                        }
+                    }
+                }
+                Err(e)
+            })
         } else {
             Err(Error::UndetectedSyntax("[unknown]".into()))
         };
 
+        // If a path wasn't provided, or if path based syntax detection
+        // above failed, we fall back to first-line syntax detection.
         match path_syntax {
-            // If a path wasn't provided, or if path based syntax detection
-            // above failed, we fall back to first-line syntax detection.
-            Err(Error::UndetectedSyntax(path)) => self
-                .get_first_line_syntax(&mut input.reader)?
-                .ok_or(Error::UndetectedSyntax(path)),
+            Err(Error::UndetectedSyntax(path)) => {
+                if let Some(syntax_in_set) = self.get_first_line_syntax(&mut input.reader)? {
+                    Ok(syntax_in_set)
+                } else if let Some(language) = fallback_syntax {
+                    self.find_syntax_by_token(language)?
+                        .ok_or_else(|| Error::UnknownSyntax(language.to_owned()))
+                } else {
+                    Err(Error::UndetectedSyntax(path))
+                }
+            }
             _ => path_syntax,
         }
     }
@@ -244,14 +280,17 @@ impl HighlightingAssets {
     pub(crate) fn find_syntax_by_name(
         &self,
         syntax_name: &str,
-    ) -> Result<Option<SyntaxReferenceInSet>> {
+    ) -> Result<Option<SyntaxReferenceInSet<'_>>> {
         let syntax_set = self.get_syntax_set()?;
         Ok(syntax_set
             .find_syntax_by_name(syntax_name)
             .map(|syntax| SyntaxReferenceInSet { syntax, syntax_set }))
     }
 
-    fn find_syntax_by_extension(&self, e: Option<&OsStr>) -> Result<Option<SyntaxReferenceInSet>> {
+    fn find_syntax_by_extension(
+        &self,
+        e: Option<&OsStr>,
+    ) -> Result<Option<SyntaxReferenceInSet<'_>>> {
         let syntax_set = self.get_syntax_set()?;
         let extension = e.and_then(|x| x.to_str()).unwrap_or_default();
         Ok(syntax_set
@@ -259,12 +298,40 @@ impl HighlightingAssets {
             .map(|syntax| SyntaxReferenceInSet { syntax, syntax_set }))
     }
 
+    fn find_syntax_by_hidden_file_name(
+        &self,
+        file_name: &OsStr,
+    ) -> Result<Option<SyntaxReferenceInSet<'_>>> {
+        let Some(hidden_file_extension) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix('.'))
+            .filter(|name| !name.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        // syntect stores `hidden_file_extensions` in the same extension list as
+        // regular file extensions, but dotfiles must be queried without the
+        // leading period.
+        self.find_syntax_by_extension(Some(OsStr::new(hidden_file_extension)))
+    }
+
+    fn find_syntax_by_token(&self, token: &str) -> Result<Option<SyntaxReferenceInSet<'_>>> {
+        let syntax_set = self.get_syntax_set()?;
+        Ok(syntax_set
+            .find_syntax_by_token(token)
+            .map(|syntax| SyntaxReferenceInSet { syntax, syntax_set }))
+    }
+
     fn get_syntax_for_file_name(
         &self,
         file_name: &OsStr,
         ignored_suffixes: &IgnoredSuffixes,
-    ) -> Result<Option<SyntaxReferenceInSet>> {
+    ) -> Result<Option<SyntaxReferenceInSet<'_>>> {
         let mut syntax = self.find_syntax_by_extension(Some(file_name))?;
+        if syntax.is_none() {
+            syntax = self.find_syntax_by_hidden_file_name(file_name)?;
+        }
         if syntax.is_none() {
             syntax =
                 ignored_suffixes.try_with_stripped_suffix(file_name, |stripped_file_name| {
@@ -279,26 +346,30 @@ impl HighlightingAssets {
         &self,
         file_name: &OsStr,
         ignored_suffixes: &IgnoredSuffixes,
-    ) -> Result<Option<SyntaxReferenceInSet>> {
-        let mut syntax = self.find_syntax_by_extension(Path::new(file_name).extension())?;
-        if syntax.is_none() {
-            syntax =
-                ignored_suffixes.try_with_stripped_suffix(file_name, |stripped_file_name| {
-                    // Note: recursion
-                    self.get_syntax_for_file_extension(stripped_file_name, ignored_suffixes)
-                })?;
+    ) -> Result<Option<SyntaxReferenceInSet<'_>>> {
+        let stripped =
+            ignored_suffixes.try_with_stripped_suffix(file_name, |stripped_file_name| {
+                self.get_syntax_for_file_extension(stripped_file_name, ignored_suffixes)
+                    .map(Some)
+            })?;
+        match stripped {
+            Some(syntax) => Ok(syntax),
+            None => self.find_syntax_by_extension(Path::new(file_name).extension()),
         }
-        Ok(syntax)
     }
 
     fn get_first_line_syntax(
         &self,
         reader: &mut InputReader,
-    ) -> Result<Option<SyntaxReferenceInSet>> {
+    ) -> Result<Option<SyntaxReferenceInSet<'_>>> {
         let syntax_set = self.get_syntax_set()?;
-        Ok(String::from_utf8(reader.first_line.clone())
+        Ok(std::str::from_utf8(&reader.first_line)
             .ok()
-            .and_then(|l| syntax_set.find_syntax_by_first_line(&l))
+            .and_then(|l| {
+                // Strip UTF-8 BOM if present
+                let line = l.strip_prefix('\u{feff}').unwrap_or(l);
+                syntax_set.find_syntax_by_first_line(line)
+            })
             .map(|syntax| SyntaxReferenceInSet { syntax, syntax_set }))
     }
 }
@@ -343,8 +414,7 @@ fn asset_from_cache<T: serde::de::DeserializeOwned>(
 ) -> Result<T> {
     let contents = fs::read(path).map_err(|_| {
         format!(
-            "Could not load cached {} '{}'",
-            description,
+            "Could not load cached {description} '{}'",
             path.to_string_lossy()
         )
     })?;
@@ -382,11 +452,12 @@ mod tests {
         fn get_syntax_name(
             &self,
             language: Option<&str>,
+            fallback_syntax: Option<&str>,
             input: &mut OpenedInput,
             mapping: &SyntaxMapping,
         ) -> String {
             self.assets
-                .get_syntax(language, input, mapping)
+                .get_syntax(language, fallback_syntax, input, mapping)
                 .map(|syntax_in_set| syntax_in_set.syntax.name.clone())
                 .unwrap_or_else(|_| "!no syntax!".to_owned())
         }
@@ -406,7 +477,7 @@ mod tests {
             let dummy_stdin: &[u8] = &[];
             let mut opened_input = input.open(dummy_stdin, None).unwrap();
 
-            self.get_syntax_name(None, &mut opened_input, &self.syntax_mapping)
+            self.get_syntax_name(None, None, &mut opened_input, &self.syntax_mapping)
         }
 
         fn syntax_for_file_with_content_os(&self, file_name: &OsStr, first_line: &str) -> String {
@@ -416,7 +487,7 @@ mod tests {
             let dummy_stdin: &[u8] = &[];
             let mut opened_input = input.open(dummy_stdin, None).unwrap();
 
-            self.get_syntax_name(None, &mut opened_input, &self.syntax_mapping)
+            self.get_syntax_name(None, None, &mut opened_input, &self.syntax_mapping)
         }
 
         #[cfg(unix)]
@@ -436,7 +507,7 @@ mod tests {
             let input = Input::stdin().with_name(Some(file_name));
             let mut opened_input = input.open(content, None).unwrap();
 
-            self.get_syntax_name(None, &mut opened_input, &self.syntax_mapping)
+            self.get_syntax_name(None, None, &mut opened_input, &self.syntax_mapping)
         }
 
         fn syntax_is_same_for_inputkinds(&self, file_name: &str, content: &str) -> bool {
@@ -534,6 +605,41 @@ mod tests {
     }
 
     #[test]
+    fn syntax_detection_first_line_with_utf8_bom() {
+        let test = SyntaxDetectionTest::new();
+
+        // Test that XML files are detected correctly even with UTF-8 BOM
+        // The BOM should be stripped before first-line syntax detection
+        let xml_with_bom = "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?>";
+        assert_eq!(
+            test.syntax_for_file_with_content("unknown_file", xml_with_bom),
+            "XML"
+        );
+
+        // Test the specific .csproj case mentioned in the issue
+        // Even if .csproj has extension mapping, this tests first-line fallback
+        let csproj_content_with_bom = "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Project ToolsVersion=\"15.0\" xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">";
+        assert_eq!(
+            test.syntax_for_file_with_content("test.csproj", csproj_content_with_bom),
+            "XML"
+        );
+
+        // Test that shell scripts are detected correctly even with UTF-8 BOM
+        let script_with_bom = "\u{feff}#!/bin/bash";
+        assert_eq!(
+            test.syntax_for_file_with_content("unknown_script", script_with_bom),
+            "Bourne Again Shell (bash)"
+        );
+
+        // Test that PHP files are detected correctly even with UTF-8 BOM
+        let php_with_bom = "\u{feff}<?php";
+        assert_eq!(
+            test.syntax_for_file_with_content("unknown_php", php_with_bom),
+            "PHP"
+        );
+    }
+
+    #[test]
     fn syntax_detection_with_custom_mapping() {
         let mut test = SyntaxDetectionTest::new();
 
@@ -581,6 +687,48 @@ mod tests {
     }
 
     #[test]
+    fn syntax_detection_ignored_suffix_falls_back_to_first_line() {
+        let mut test = SyntaxDetectionTest::new();
+
+        // By default a `.txt` file uses Plain Text, even with a shebang: the
+        // `.txt` extension wins and first-line detection is not reached.
+        assert_eq!(
+            test.syntax_for_file_with_content("test.txt", "#!/usr/bin/env bash"),
+            "Plain Text"
+        );
+
+        // Once `.txt` is an ignored suffix it is stripped before detection. The
+        // stripped name (`test`) has no extension, so detection falls back to the
+        // first line -- even though `.txt` is itself a registered extension that
+        // would otherwise match as Plain Text. See #2745.
+        test.syntax_mapping.insert_ignored_suffix(".txt");
+        assert_eq!(
+            test.syntax_for_file_with_content("test.txt", "#!/usr/bin/env bash"),
+            "Bourne Again Shell (bash)"
+        );
+        assert_eq!(
+            test.syntax_for_file_with_content("test.txt", "<?php"),
+            "PHP"
+        );
+
+        // A `.txt` file without a recognizable first line keeps no syntax (the
+        // caller renders it as plain text); we must not resurrect the shadowed
+        // `.txt` -> Plain Text match here.
+        assert_eq!(
+            test.syntax_for_file_with_content("notes.txt", "just some prose"),
+            "!no syntax!"
+        );
+
+        // Stripping that exposes a real extension still works: `.dev` is ignored,
+        // and the remaining `.json` extension is detected as usual.
+        test.syntax_mapping.insert_ignored_suffix(".dev");
+        assert_eq!(
+            test.syntax_for_file_with_content("config.json.dev", ""),
+            "JSON"
+        );
+    }
+
+    #[test]
     fn syntax_detection_is_case_insensitive() {
         let mut test = SyntaxDetectionTest::new();
 
@@ -613,6 +761,55 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "build-assets")]
+    #[test]
+    fn syntax_detection_hidden_file_extensions() {
+        let source_dir = TempDir::new().expect("creation of temporary source directory");
+        let cache_dir = TempDir::new().expect("creation of temporary cache directory");
+        let syntax_dir = source_dir.path().join("syntaxes");
+
+        std::fs::create_dir_all(&syntax_dir).expect("creation of syntax directory succeeds");
+        std::fs::write(
+            syntax_dir.join("HiddenFileExtension.sublime-syntax"),
+            r#"%YAML 1.2
+---
+name: Hidden File Extension
+hidden_file_extensions:
+  - testrc
+scope: source.hiddenfileextension
+
+contexts:
+  main:
+    - match: .
+      scope: source.hiddenfileextension
+"#,
+        )
+        .expect("custom syntax can be written");
+
+        build(
+            source_dir.path(),
+            false,
+            false,
+            cache_dir.path(),
+            env!("CARGO_PKG_VERSION"),
+        )
+        .expect("custom assets can be built");
+
+        let test = SyntaxDetectionTest {
+            assets: HighlightingAssets::from_cache(cache_dir.path())
+                .expect("custom syntax cache can be loaded"),
+            syntax_mapping: SyntaxMapping::new(),
+            temp_dir: TempDir::new().expect("creation of temporary directory"),
+        };
+
+        assert_eq!(test.syntax_for_file(".testrc"), "Hidden File Extension");
+        assert_eq!(
+            test.syntax_for_stdin_with_content(".testrc", b""),
+            "Hidden File Extension"
+        );
+        assert!(test.syntax_is_same_for_inputkinds(".testrc", ""));
+    }
+
     #[cfg(unix)]
     #[test]
     fn syntax_detection_for_symlinked_file() {
@@ -634,8 +831,35 @@ mod tests {
         let mut opened_input = input.open(dummy_stdin, None).unwrap();
 
         assert_eq!(
-            test.get_syntax_name(None, &mut opened_input, &test.syntax_mapping),
+            test.get_syntax_name(None, None, &mut opened_input, &test.syntax_mapping),
             "SSH Config"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn syntax_detection_for_symlinked_file_by_target_extension() {
+        use std::os::unix::fs::symlink;
+
+        let test = SyntaxDetectionTest::new();
+
+        let formula_dir = test.temp_dir.path().join("Formula");
+        std::fs::create_dir(&formula_dir).unwrap();
+        let target = formula_dir.join("zero-install.rb");
+        File::create(&target).unwrap();
+
+        let aliases_dir = test.temp_dir.path().join("Aliases");
+        std::fs::create_dir(&aliases_dir).unwrap();
+        let link = aliases_dir.join("0install");
+        symlink(&target, &link).unwrap();
+
+        let input = Input::ordinary_file(&link);
+        let dummy_stdin: &[u8] = &[];
+        let mut opened_input = input.open(dummy_stdin, None).unwrap();
+
+        assert_eq!(
+            test.get_syntax_name(None, None, &mut opened_input, &test.syntax_mapping),
+            "Ruby"
         );
     }
 }

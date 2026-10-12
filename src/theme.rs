@@ -266,10 +266,10 @@ impl ColorSchemeDetector for TerminalColorSchemeDetector {
     }
 
     fn detect(&self) -> Option<ColorScheme> {
-        use terminal_colorsaurus::{color_scheme, ColorScheme as ColorsaurusScheme, QueryOptions};
-        match color_scheme(QueryOptions::default()).ok()? {
-            ColorsaurusScheme::Dark => Some(ColorScheme::Dark),
-            ColorsaurusScheme::Light => Some(ColorScheme::Light),
+        use terminal_colorsaurus::{theme_mode, QueryOptions, ThemeMode};
+        match theme_mode(QueryOptions::default()).ok()? {
+            ThemeMode::Dark => Some(ColorScheme::Dark),
+            ThemeMode::Light => Some(ColorScheme::Light),
         }
     }
 }
@@ -288,7 +288,7 @@ fn color_scheme_from_system() -> Option<ColorScheme> {
     const PREFERENCES_FILE: &str = "Library/Preferences/.GlobalPreferences.plist";
     const STYLE_KEY: &str = "AppleInterfaceStyle";
 
-    let preferences_file = home::home_dir()
+    let preferences_file = std::env::home_dir()
         .map(|home| home.join(PREFERENCES_FILE))
         .expect("Could not get home directory");
 

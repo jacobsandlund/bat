@@ -1,4 +1,14 @@
 use bat::assets::HighlightingAssets;
+use syntect::highlighting::ThemeSet;
+
+#[test]
+fn embedded_custom_themes_match_sources() {
+    let assets = HighlightingAssets::from_binary();
+    for name in ["GitHub-diff", "ansi"] {
+        let expected = ThemeSet::get_theme(format!("assets/themes/{name}.tmTheme")).unwrap();
+        assert_eq!(assets.get_theme(name), &expected);
+    }
+}
 
 /// This test ensures that we are not accidentally removing themes due to submodule updates.
 /// It is 'ignore'd by default because it requires themes.bin to be up-to-date.
@@ -14,6 +24,10 @@ fn all_themes_are_present() {
         themes,
         vec![
             "1337",
+            "Catppuccin Frappe",
+            "Catppuccin Latte",
+            "Catppuccin Macchiato",
+            "Catppuccin Mocha",
             "Coldark-Cold",
             "Coldark-Dark",
             "DarkNeon",

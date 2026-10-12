@@ -1,5 +1,3 @@
-use std::fmt;
-use std::io;
 use std::vec::Vec;
 
 use nu_ansi_term::Color::{Fixed, Green, Red, Yellow};
@@ -17,6 +15,7 @@ use content_inspector::ContentType;
 
 use encoding_rs::{UTF_16BE, UTF_16LE};
 
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 use crate::assets::{HighlightingAssets, SyntaxReferenceInSet};
@@ -28,15 +27,28 @@ use crate::decorations::{Decoration, GridBorderDecoration, LineNumberDecoration}
 use crate::diff::LineChanges;
 use crate::error::*;
 use crate::input::OpenedInput;
-use crate::line_range::RangeCheckResult;
-use crate::preprocessor::strip_ansi;
-use crate::preprocessor::{expand_tabs, replace_nonprintable};
+use crate::line_range::{MaxBufferedLineNumber, RangeCheckResult};
+use crate::output::OutputHandle;
+use crate::preprocessor::{
+    expand_tabs, replace_nonprintable, sanitize, sanitize_for_terminal, strip_ansi,
+    strip_overstrike,
+};
 use crate::style::StyleComponent;
 use crate::terminal::{as_terminal_escaped, to_ansi_color};
 use crate::vscreen::{AnsiStyle, EscapeSequence, EscapeSequenceIterator};
 use crate::wrapping::WrappingMode;
 use crate::BinaryBehavior;
 use crate::StripAnsiMode;
+
+// Return the displayed width of a character.
+//
+// Control characters (0x00..=0x1F and 0x7F) are rendered by the terminal
+// in caret notation (e.g. ^@, ^A, ..., ^?), which occupies two columns.
+// UnicodeWidthChar::width() returns None for these, so we map them to 2
+// here instead of the previous default of 0.
+fn char_width(c: char) -> usize {
+    c.width().unwrap_or(if c.is_control() { 2 } else { 0 })
+}
 
 const ANSI_UNDERLINE_ENABLE: EscapeSequence = EscapeSequence::CSI {
     raw_sequence: "\x1B[4m",
@@ -68,20 +80,6 @@ const EMPTY_SYNTECT_STYLE: syntect::highlighting::Style = syntect::highlighting:
     font_style: FontStyle::empty(),
 };
 
-pub enum OutputHandle<'a> {
-    IoWrite(&'a mut dyn io::Write),
-    FmtWrite(&'a mut dyn fmt::Write),
-}
-
-impl OutputHandle<'_> {
-    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<()> {
-        match self {
-            Self::IoWrite(handle) => handle.write_fmt(args).map_err(Into::into),
-            Self::FmtWrite(handle) => handle.write_fmt(args).map_err(Into::into),
-        }
-    }
-}
-
 pub(crate) trait Printer {
     fn print_header(
         &mut self,
@@ -99,6 +97,7 @@ pub(crate) trait Printer {
         handle: &mut OutputHandle,
         line_number: usize,
         line_buffer: &[u8],
+        max_buffered_line_number: MaxBufferedLineNumber,
     ) -> Result<()>;
 }
 
@@ -140,6 +139,7 @@ impl Printer for SimplePrinter<'_> {
         handle: &mut OutputHandle,
         _line_number: usize,
         line_buffer: &[u8],
+        _max_buffered_line_number: MaxBufferedLineNumber,
     ) -> Result<()> {
         // Skip squeezed lines.
         if let Some(squeeze_limit) = self.config.squeeze_lines {
@@ -211,6 +211,8 @@ pub(crate) struct InteractivePrinter<'a> {
     background_color_highlight: Option<Color>,
     consecutive_empty_lines: usize,
     strip_ansi: bool,
+    sanitize: bool,
+    strip_overstrike: bool,
 }
 
 impl<'a> InteractivePrinter<'a> {
@@ -239,7 +241,9 @@ impl<'a> InteractivePrinter<'a> {
 
         #[cfg(feature = "git")]
         {
-            if config.style_components.changes() {
+            if config.style_components.changes()
+                && line_changes.as_ref().is_some_and(|c| !c.is_empty())
+            {
                 decorations.push(Box::new(LineChangesDecoration::new(&colors)));
             }
         }
@@ -271,19 +275,31 @@ impl<'a> InteractivePrinter<'a> {
 
         let needs_to_match_syntax = (!is_printing_binary
             || matches!(config.binary, BinaryBehavior::AsText))
-            && (config.colored_output || config.strip_ansi == StripAnsiMode::Auto);
+            && (config.colored_output
+                || config.strip_ansi == StripAnsiMode::Auto
+                || config.sanitize == StripAnsiMode::Auto);
 
-        let (is_plain_text, highlighter_from_set) = if needs_to_match_syntax {
+        let (is_plain_text, strip_overstrike, highlighter_from_set) = if needs_to_match_syntax {
             // Determine the type of syntax for highlighting
             const PLAIN_TEXT_SYNTAX: &str = "Plain Text";
-            match assets.get_syntax(config.language, input, &config.syntax_mapping) {
+            const MANPAGE_SYNTAX: &str = "Manpage";
+            const COMMAND_HELP_SYNTAX: &str = "Command Help";
+            match assets.get_syntax(
+                config.language,
+                config.fallback_syntax,
+                input,
+                &config.syntax_mapping,
+            ) {
                 Ok(syntax_in_set) => (
                     syntax_in_set.syntax.name == PLAIN_TEXT_SYNTAX,
+                    syntax_in_set.syntax.name == MANPAGE_SYNTAX
+                        || syntax_in_set.syntax.name == COMMAND_HELP_SYNTAX,
                     Some(HighlighterFromSet::new(syntax_in_set, theme)),
                 ),
 
                 Err(Error::UndetectedSyntax(_)) => (
                     true,
+                    false,
                     Some(
                         assets
                             .find_syntax_by_name(PLAIN_TEXT_SYNTAX)?
@@ -295,7 +311,7 @@ impl<'a> InteractivePrinter<'a> {
                 Err(e) => return Err(e),
             }
         } else {
-            (false, None)
+            (false, false, None)
         };
 
         // Determine when to strip ANSI sequences
@@ -303,6 +319,14 @@ impl<'a> InteractivePrinter<'a> {
             _ if config.show_nonprintable => false,
             StripAnsiMode::Always => true,
             StripAnsiMode::Auto if is_plain_text => false, // Plain text may already contain escape sequences.
+            StripAnsiMode::Auto => true,
+            _ => false,
+        };
+
+        let sanitize = match config.sanitize {
+            _ if config.show_nonprintable => false,
+            StripAnsiMode::Always => true,
+            StripAnsiMode::Auto if is_plain_text => false,
             StripAnsiMode::Auto => true,
             _ => false,
         };
@@ -320,6 +344,8 @@ impl<'a> InteractivePrinter<'a> {
             background_color_highlight,
             consecutive_empty_lines: 0,
             strip_ansi,
+            sanitize,
+            strip_overstrike,
         })
     }
 
@@ -341,7 +367,7 @@ impl<'a> InteractivePrinter<'a> {
             self.print_horizontal_line_term(handle, self.colors.grid)?;
         } else {
             let hline = "─".repeat(self.config.term_width - (self.panel_width + 1));
-            let hline = format!("{}{}{}", "─".repeat(self.panel_width), grid_char, hline);
+            let hline = format!("{}{grid_char}{hline}", "─".repeat(self.panel_width));
             writeln!(handle, "{}", self.colors.grid.paint(hline))?;
         }
 
@@ -355,8 +381,7 @@ impl<'a> InteractivePrinter<'a> {
 
         let text_truncated: String = text.chars().take(self.panel_width - 1).collect();
         let text_filled: String = format!(
-            "{}{}",
-            text_truncated,
+            "{text_truncated}{}",
             " ".repeat(self.panel_width - 1 - text_truncated.len())
         );
         if self.config.style_components.grid() {
@@ -403,14 +428,18 @@ impl<'a> InteractivePrinter<'a> {
         handle: &mut OutputHandle,
         content: &str,
     ) -> Result<()> {
-        let mut content = content;
         let content_width = self.config.term_width - self.get_header_component_indent_length();
-        while content.len() > content_width {
-            let (content_line, remaining) = content.split_at(content_width);
-            self.print_header_component_with_indent(handle, content_line)?;
-            content = remaining;
+        if content.chars().count() <= content_width {
+            return self.print_header_component_with_indent(handle, content);
         }
-        self.print_header_component_with_indent(handle, content)
+
+        let mut content_graphemes: Vec<&str> = content.graphemes(true).collect();
+        while content_graphemes.len() > content_width {
+            let (content_line, remaining) = content_graphemes.split_at(content_width);
+            self.print_header_component_with_indent(handle, content_line.join("").as_str())?;
+            content_graphemes = remaining.to_vec();
+        }
+        self.print_header_component_with_indent(handle, content_graphemes.join("").as_str())
     }
 
     fn highlight_regions_for_line<'b>(
@@ -455,6 +484,11 @@ impl Printer for InteractivePrinter<'_> {
         input: &OpenedInput,
         add_header_padding: bool,
     ) -> Result<()> {
+        // If input is empty and quiet_empty is enabled, skip all output
+        if self.content_type.is_none() && self.config.quiet_empty {
+            return Ok(());
+        }
+
         if add_header_padding && self.config.style_components.rule() {
             self.print_horizontal_line_term(handle, self.colors.rule)?;
         }
@@ -470,7 +504,7 @@ impl Printer for InteractivePrinter<'_> {
                      (but will be present if the output of 'bat' is piped). You can use 'bat -A' \
                      to show the binary file contents.",
                     Yellow.paint("[bat warning]"),
-                    input.description.summary(),
+                    sanitize_for_terminal(&input.description.summary()),
                 )?;
             } else if self.config.style_components.grid() {
                 self.print_horizontal_line(handle, '┬')?;
@@ -521,13 +555,14 @@ impl Printer for InteractivePrinter<'_> {
             .try_for_each(|component| match component {
                 StyleComponent::HeaderFilename => {
                     let header_filename = format!(
-                        "{}{}{}",
+                        "{}{}{mode}",
                         description
                             .kind()
-                            .map(|kind| format!("{kind}: "))
+                            .map(|kind| format!("{}: ", sanitize_for_terminal(kind)))
                             .unwrap_or_else(|| "".into()),
-                        self.colors.header_value.paint(description.title()),
-                        mode
+                        self.colors
+                            .header_value
+                            .paint(sanitize_for_terminal(description.title())),
                     );
                     self.print_header_multiline_component(handle, &header_filename)
                 }
@@ -558,6 +593,11 @@ impl Printer for InteractivePrinter<'_> {
     }
 
     fn print_footer(&mut self, handle: &mut OutputHandle, _input: &OpenedInput) -> Result<()> {
+        // If input is empty and quiet_empty is enabled, skip footer
+        if self.content_type.is_none() && self.config.quiet_empty {
+            return Ok(());
+        }
+
         if self.config.style_components.grid()
             && (self.content_type.is_some_and(|c| c.is_text())
                 || self.config.show_nonprintable
@@ -576,11 +616,23 @@ impl Printer for InteractivePrinter<'_> {
         let title = "8<";
         let title_count = title.chars().count();
 
-        let snip_left = "─ ".repeat((self.config.term_width - panel_count - (title_count / 2)) / 4);
+        let snip_left = "─ ".repeat(
+            self.config
+                .term_width
+                .saturating_sub(panel_count)
+                .saturating_sub(title_count / 2)
+                / 4,
+        );
         let snip_left_count = snip_left.chars().count(); // Can't use .len() with Unicode.
 
-        let snip_right =
-            " ─".repeat((self.config.term_width - panel_count - snip_left_count - title_count) / 2);
+        let snip_right = " ─".repeat(
+            self.config
+                .term_width
+                .saturating_sub(panel_count)
+                .saturating_sub(snip_left_count)
+                .saturating_sub(title_count)
+                / 2,
+        );
 
         writeln!(
             handle,
@@ -599,6 +651,7 @@ impl Printer for InteractivePrinter<'_> {
         handle: &mut OutputHandle,
         line_number: usize,
         line_buffer: &[u8],
+        max_buffered_line_number: MaxBufferedLineNumber,
     ) -> Result<()> {
         let line = if self.config.show_nonprintable {
             replace_nonprintable(
@@ -629,8 +682,16 @@ impl Printer for InteractivePrinter<'_> {
                 }
             };
 
-            // If ANSI escape sequences are supposed to be stripped, do it before syntax highlighting.
-            if self.strip_ansi {
+            if self.strip_overstrike {
+                if let Some(pos) = line.find('\x08') {
+                    line = strip_overstrike(&line, pos).into();
+                }
+            }
+
+            // Sanitize is the strict superset; otherwise strip-ansi alone.
+            if self.sanitize {
+                line = sanitize(&line).into()
+            } else if self.strip_ansi {
                 line = strip_ansi(&line).into()
             }
 
@@ -660,8 +721,12 @@ impl Printer for InteractivePrinter<'_> {
         let mut panel_wrap: Option<String> = None;
 
         // Line highlighting
-        let highlight_this_line =
-            self.config.highlighted_lines.0.check(line_number) == RangeCheckResult::InRange;
+        let highlight_this_line = self
+            .config
+            .highlighted_lines
+            .0
+            .check(line_number, max_buffered_line_number)
+            == RangeCheckResult::InRange;
 
         if highlight_this_line && self.config.theme == "ansi" {
             self.ansi_style.update(ANSI_UNDERLINE_ENABLE);
@@ -673,10 +738,17 @@ impl Printer for InteractivePrinter<'_> {
 
         // Line decorations.
         if self.panel_width > 0 {
+            let display_line_number =
+                if self.config.number_nonblank && line.trim_end_matches(['\r', '\n']).is_empty() {
+                    0
+                } else {
+                    line_number
+                };
+
             let decorations = self
                 .decorations
                 .iter()
-                .map(|d| d.generate(line_number, false, self));
+                .map(|d| d.generate(display_line_number, false, self));
 
             for deco in decorations {
                 write!(handle, "{} ", deco.text)?;
@@ -704,7 +776,7 @@ impl Printer for InteractivePrinter<'_> {
                                 "{}{}",
                                 as_terminal_escaped(
                                     style,
-                                    &format!("{}{}", self.ansi_style, text_trimmed),
+                                    &format!("{}{text_trimmed}", self.ansi_style),
                                     true_color,
                                     colored_output,
                                     italics,
@@ -762,10 +834,20 @@ impl Printer for InteractivePrinter<'_> {
                             // Displayed width of line_buf
                             let mut current_width = 0;
 
+                            let word_wrap = matches!(self.config.wrapping_mode, WrappingMode::Word);
+
+                            // For word wrapping, track last whitespace position.
+                            let mut last_ws_idx: Option<usize> = None;
+
                             for c in text.chars() {
                                 // calculate the displayed width for next character
-                                let cw = c.width().unwrap_or(0);
+                                let cw = char_width(c);
                                 current_width += cw;
+
+                                // Track whitespace positions for word wrapping.
+                                if word_wrap && c.is_whitespace() {
+                                    last_ws_idx = Some(line_buf.len());
+                                }
 
                                 // if next character cannot be printed on this line,
                                 // flush the buffer.
@@ -788,13 +870,37 @@ impl Printer for InteractivePrinter<'_> {
                                         }
                                     }
 
+                                    // Determine the break point and remainder
+                                    // for word wrapping.
+                                    let (emit_end, rest_start) = if word_wrap {
+                                        if let Some(ws_idx) = last_ws_idx {
+                                            // Skip the whitespace character itself
+                                            // and carry the rest to the next line.
+                                            let rs = ws_idx
+                                                + line_buf[ws_idx..]
+                                                    .chars()
+                                                    .next()
+                                                    .map(|ch| ch.len_utf8())
+                                                    .unwrap_or(0);
+                                            (ws_idx, Some(rs))
+                                        } else {
+                                            (line_buf.len(), None)
+                                        }
+                                    } else {
+                                        (line_buf.len(), None)
+                                    };
+
                                     // It wraps.
                                     write!(
                                         handle,
                                         "{}{}\n{}",
                                         as_terminal_escaped(
                                             style,
-                                            &format!("{}{}", self.ansi_style, line_buf),
+                                            &format!(
+                                                "{}{}",
+                                                self.ansi_style,
+                                                &line_buf[..emit_end]
+                                            ),
                                             self.config.true_color,
                                             self.config.colored_output,
                                             self.config.use_italic_text,
@@ -807,8 +913,19 @@ impl Printer for InteractivePrinter<'_> {
                                     cursor = 0;
                                     max_width = cursor_max;
 
-                                    line_buf.clear();
-                                    current_width = cw;
+                                    if let Some(rs) = rest_start {
+                                        // Word wrap: carry remainder to next line.
+                                        let remainder = line_buf[rs..].to_string();
+                                        let rem_width: usize =
+                                            remainder.chars().map(char_width).sum();
+                                        line_buf.clear();
+                                        line_buf.push_str(&remainder);
+                                        current_width = rem_width + cw;
+                                    } else {
+                                        line_buf.clear();
+                                        current_width = cw;
+                                    }
+                                    last_ws_idx = None;
                                 }
 
                                 line_buf.push(c);
@@ -821,7 +938,7 @@ impl Printer for InteractivePrinter<'_> {
                                 "{}",
                                 as_terminal_escaped(
                                     style,
-                                    &format!("{}{}", self.ansi_style, line_buf),
+                                    &format!("{}{line_buf}", self.ansi_style),
                                     self.config.true_color,
                                     self.config.colored_output,
                                     self.config.use_italic_text,

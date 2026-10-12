@@ -10,6 +10,7 @@ use crate::{
     error::Result,
     input,
     line_range::{HighlightedLineRanges, LineRange, LineRanges},
+    output::OutputHandle,
     style::StyleComponent,
     StripAnsiMode, SyntaxMapping, WrappingMode,
 };
@@ -191,6 +192,15 @@ impl<'a> PrettyPrinter<'a> {
         self
     }
 
+    /// Whether to sanitize untrusted input for safe display (default: never)
+    ///
+    /// Strips ANSI escape sequences and additionally substitutes terminal-active
+    /// control bytes and bidi / zero-width codepoints with U+FFFD.
+    pub fn sanitize(&mut self, mode: StripAnsiMode) -> &mut Self {
+        self.config.sanitize = mode;
+        self
+    }
+
     /// Text wrapping mode (default: do not wrap)
     pub fn wrapping_mode(&mut self, mode: WrappingMode) -> &mut Self {
         self.config.wrapping_mode = mode;
@@ -325,7 +335,10 @@ impl<'a> PrettyPrinter<'a> {
 
         // If writer is provided, pass it to the controller, otherwise pass None
         if let Some(mut w) = writer {
-            controller.run(inputs.into_iter().map(|i| i.into()).collect(), Some(&mut w))
+            controller.run(
+                inputs.into_iter().map(|i| i.into()).collect(),
+                Some(&mut OutputHandle::FmtWrite(&mut w)),
+            )
         } else {
             controller.run(inputs.into_iter().map(|i| i.into()).collect(), None)
         }

@@ -3,6 +3,7 @@ use std::env;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::thread::available_parallelism;
 
 use crate::{
     clap_app,
@@ -37,9 +38,31 @@ pub fn env_no_color() -> bool {
     env::var_os("NO_COLOR").is_some_and(|x| !x.is_empty())
 }
 
+fn parse_strip_ansi_value(raw: Option<&str>, flag_name: &str) -> StripAnsiMode {
+    match raw {
+        Some("never") | None => StripAnsiMode::Never,
+        Some("always") => StripAnsiMode::Always,
+        Some("auto") => StripAnsiMode::Auto,
+        _ => unreachable!("other values for {flag_name} are not allowed"),
+    }
+}
+
+enum HelpType {
+    Short,
+    Long,
+}
+
 pub struct App {
     pub matches: ArgMatches,
     interactive_output: bool,
+    /// True if -n / --number was passed on the command line
+    /// (not from config file or environment variables).
+    /// This is used to honor the flag when piping output, similar to `cat -n`.
+    number_from_cli: bool,
+    /// True if -b / --number-nonblank was passed on the command line
+    /// (not from config file or environment variables).
+    /// This is used to honor the flag when piping output, similar to `cat -b`.
+    number_nonblank_from_cli: bool,
 }
 
 impl App {
@@ -49,53 +72,201 @@ impl App {
 
         let interactive_output = std::io::stdout().is_terminal();
 
+        // Parse the original command line separately from config and environment arguments.
+        // Using clap here keeps CLI-only detection consistent with the final parser, including
+        // option terminators, combined short flags, and options that take values.
+        let cli_matches = Self::cli_matches(interactive_output);
+        let number_from_cli = cli_matches.get_flag("number");
+        let number_nonblank_from_cli = cli_matches.get_flag("number-nonblank");
+
+        let matches = Self::matches(interactive_output)?;
+
+        if matches.get_flag("help") {
+            let help_type = if wild::args_os().any(|arg| arg == "--help") {
+                HelpType::Long
+            } else {
+                HelpType::Short
+            };
+
+            let use_pager = match matches.get_one::<String>("paging").map(|s| s.as_str()) {
+                Some("never") => false,
+                _ => !matches.get_flag("no-paging"),
+            };
+
+            let use_color = match matches.get_one::<String>("color").map(|s| s.as_str()) {
+                Some("always") => true,
+                Some("never") => false,
+                _ => interactive_output, // auto: use color if interactive
+            };
+
+            let pager = matches.get_one::<String>("pager").map(|s| s.as_str());
+            let theme_options = Self::theme_options_from_matches(&matches);
+            let use_custom_assets = !matches.get_flag("no-custom-assets");
+
+            Self::display_help(
+                interactive_output,
+                help_type,
+                use_pager,
+                use_color,
+                pager,
+                theme_options,
+                use_custom_assets,
+            )?;
+            std::process::exit(0);
+        }
+
         Ok(App {
-            matches: Self::matches(interactive_output)?,
+            matches,
             interactive_output,
+            number_from_cli,
+            number_nonblank_from_cli,
         })
     }
 
-    fn matches(interactive_output: bool) -> Result<ArgMatches> {
-        let args = if wild::args_os().nth(1) == Some("cache".into()) {
-            // Skip the config file and env vars
-
-            wild::args_os().collect::<Vec<_>>()
-        } else if wild::args_os().any(|arg| arg == "--no-config") {
-            // Skip the arguments in bats config file
-
-            let mut cli_args = wild::args_os();
-            let mut args = get_args_from_env_vars();
-
-            // Put the zero-th CLI argument (program name) first
-            args.insert(0, cli_args.next().unwrap());
-
-            // .. and the rest at the end
-            cli_args.for_each(|a| args.push(a));
-
-            args
-        } else {
-            let mut cli_args = wild::args_os();
-
-            // Read arguments from bats config file
-            let mut args = get_args_from_env_opts_var()
-                .unwrap_or_else(get_args_from_config_file)
-                .map_err(|_| "Could not parse configuration file")?;
-
-            // Selected env vars supersede config vars
-            args.extend(get_args_from_env_vars());
-
-            // Put the zero-th CLI argument (program name) first
-            args.insert(0, cli_args.next().unwrap());
-
-            // .. and the rest at the end
-            cli_args.for_each(|a| args.push(a));
-            args
+    fn display_help(
+        interactive_output: bool,
+        help_type: HelpType,
+        use_pager: bool,
+        use_color: bool,
+        pager: Option<&str>,
+        theme_options: ThemeOptions,
+        use_custom_assets: bool,
+    ) -> Result<()> {
+        use crate::assets::assets_from_cache_or_binary;
+        use crate::directories::PROJECT_DIRS;
+        use bat::{
+            config::Config,
+            controller::Controller,
+            input::Input,
+            style::{StyleComponent, StyleComponents},
+            theme::theme,
+            PagingMode,
         };
 
-        Ok(clap_app::build_app(interactive_output).get_matches_from(args))
+        let mut cmd = clap_app::build_app(interactive_output);
+        let help_text = match help_type {
+            HelpType::Short => cmd.render_help().to_string(),
+            HelpType::Long => cmd.render_long_help().to_string(),
+        };
+
+        let inputs: Vec<Input> = vec![Input::from_reader(Box::new(help_text.as_bytes()))];
+
+        let paging_mode = if use_pager {
+            PagingMode::QuitIfOneScreen
+        } else {
+            PagingMode::Never
+        };
+
+        let help_config = Config {
+            style_components: StyleComponents::new(StyleComponent::Plain.components(false)),
+            paging_mode,
+            pager,
+            colored_output: use_color,
+            true_color: use_color,
+            language: if use_color { Some("help") } else { None },
+            theme: theme(theme_options).to_string(),
+            ..Default::default()
+        };
+
+        let cache_dir = PROJECT_DIRS.cache_dir();
+        let assets = assets_from_cache_or_binary(use_custom_assets, cache_dir)?;
+        Controller::new(&help_config, &assets)
+            .run(inputs, None)
+            .ok();
+
+        Ok(())
     }
 
-    pub fn config(&self, inputs: &[Input]) -> Result<Config> {
+    /// Build argument list with env vars and CLI args (without config file)
+    fn build_args_without_config() -> Vec<std::ffi::OsString> {
+        let mut cli_args = wild::args_os();
+        let mut args = get_args_from_env_vars();
+
+        // Put the zero-th CLI argument (program name) first
+        args.insert(0, cli_args.next().unwrap());
+
+        // .. and the rest at the end
+        cli_args.for_each(|a| args.push(a));
+
+        args
+    }
+
+    fn cli_matches(interactive_output: bool) -> ArgMatches {
+        clap_app::build_app(interactive_output).get_matches_from(wild::args_os())
+    }
+
+    fn matches(interactive_output: bool) -> Result<ArgMatches> {
+        // Check if we should skip config file processing for special arguments
+        // that don't require full application setup (version, diagnostic)
+        let should_skip_config = wild::args_os().any(|arg| {
+            matches!(
+                arg.to_str(),
+                Some("-V" | "--version" | "--diagnostic" | "--diagnostics")
+            )
+        });
+
+        // Check if help was requested - help should read the config file but be
+        // forgiving of invalid arguments (so configured theme etc. can be used)
+        let help_requested =
+            wild::args_os().any(|arg| matches!(arg.to_str(), Some("-h" | "--help")));
+
+        if wild::args_os().nth(1) == Some("cache".into()) {
+            // Skip the config file and env vars
+            let args = wild::args_os().collect::<Vec<_>>();
+            return Ok(clap_app::build_app(interactive_output).get_matches_from(args));
+        }
+
+        if wild::args_os().any(|arg| arg == "--no-config") || should_skip_config {
+            // Skip the arguments in bats config file when --no-config is present
+            // or when user requests version or diagnostic information
+            let args = Self::build_args_without_config();
+            return Ok(clap_app::build_app(interactive_output).get_matches_from(args));
+        }
+
+        // Build arguments with config file
+        let mut cli_args = wild::args_os();
+
+        // Read arguments from bats config file
+        let config_args = match get_args_from_env_opts_var() {
+            Some(result) => result,
+            None => get_args_from_config_file(),
+        };
+
+        // For help, ignore config file parse errors (use empty config instead)
+        // For non-help, propagate the error
+        let mut args = if help_requested {
+            config_args.unwrap_or_default()
+        } else {
+            config_args.map_err(|_| "Could not parse configuration file")?
+        };
+
+        // Selected env vars supersede config vars
+        args.extend(get_args_from_env_vars());
+
+        // Put the zero-th CLI argument (program name) first
+        args.insert(0, cli_args.next().unwrap());
+
+        // .. and the rest at the end
+        cli_args.for_each(|a| args.push(a));
+
+        // For help, try parsing with config, and if clap fails (e.g., invalid
+        // argument in config), fall back to parsing without config file args
+        if help_requested {
+            let app = clap_app::build_app(interactive_output);
+            match app.try_get_matches_from(args) {
+                Ok(matches) => Ok(matches),
+                Err(_) => {
+                    // Config has invalid arguments, fall back to just env vars + CLI args
+                    let fallback_args = Self::build_args_without_config();
+                    Ok(clap_app::build_app(interactive_output).get_matches_from(fallback_args))
+                }
+            }
+        } else {
+            Ok(clap_app::build_app(interactive_output).get_matches_from(args))
+        }
+    }
+
+    pub fn config(&self, inputs: &[Input]) -> Result<Config<'_>> {
         let style_components = self.style_components()?;
 
         let extra_plain = self.matches.get_count("plain") > 1;
@@ -124,7 +295,10 @@ impl App {
                 // If we have -pp as an option when in auto mode, the pager should be disabled.
                 if extra_plain || self.matches.get_flag("no-paging") {
                     PagingMode::Never
-                } else if inputs.iter().any(Input::is_stdin) {
+                } else if inputs.iter().any(Input::is_stdin)
+                    // ignore stdin when --list-themes is used because in that case no input will be read anyways
+                    && !self.matches.get_flag("list-themes")
+                {
                     // If we are reading from stdin, only enable paging if we write to an
                     // interactive terminal and if we do not *read* from an interactive
                     // terminal.
@@ -146,7 +320,9 @@ impl App {
         // start building glob matchers for builtin mappings immediately
         // this is an appropriate approach because it's statistically likely that
         // all the custom mappings need to be checked
-        syntax_mapping.start_offload_build_all();
+        if available_parallelism()?.get() > 1 {
+            syntax_mapping.start_offload_build_all();
+        }
 
         if let Some(values) = self.matches.get_many::<String>("ignored-suffix") {
             for suffix in values {
@@ -202,6 +378,10 @@ impl App {
                         None
                     }
                 }),
+            fallback_syntax: self
+                .matches
+                .get_one::<String>("fallback-syntax")
+                .map(|s| s.as_str()),
             show_nonprintable: self.matches.get_flag("show-all"),
             nonprintable_notation: match self
                 .matches
@@ -217,27 +397,30 @@ impl App {
                 Some("no-printing") => BinaryBehavior::NoPrinting,
                 _ => unreachable!("other values for --binary are not allowed"),
             },
-            wrapping_mode: if self.interactive_output || maybe_term_width.is_some() {
-                if !self.matches.get_flag("chop-long-lines") {
+            wrapping_mode: {
+                if self.matches.get_flag("chop-long-lines") {
+                    WrappingMode::NoWrapping(true)
+                } else {
                     match self.matches.get_one::<String>("wrap").map(|s| s.as_str()) {
                         Some("character") => WrappingMode::Character,
+                        Some("word") => WrappingMode::Word,
                         Some("never") => WrappingMode::NoWrapping(true),
                         Some("auto") | None => {
-                            if style_components.plain() {
-                                WrappingMode::NoWrapping(false)
+                            if self.interactive_output || maybe_term_width.is_some() {
+                                if style_components.plain() && maybe_term_width.is_none() {
+                                    WrappingMode::NoWrapping(false)
+                                } else {
+                                    WrappingMode::Character
+                                }
                             } else {
-                                WrappingMode::Character
+                                // We don't have the tty width when piping to another program.
+                                // There's no point in wrapping when this is the case.
+                                WrappingMode::NoWrapping(false)
                             }
                         }
                         _ => unreachable!("other values for --wrap are not allowed"),
                     }
-                } else {
-                    WrappingMode::NoWrapping(true)
                 }
-            } else {
-                // We don't have the tty width when piping to another program.
-                // There's no point in wrapping when this is the case.
-                WrappingMode::NoWrapping(false)
             },
             colored_output: self.matches.get_flag("force-colorization")
                 || match self.matches.get_one::<String>("color").map(|s| s.as_str()) {
@@ -255,7 +438,9 @@ impl App {
                     .get_one::<String>("decorations")
                     .map(|s| s.as_str())
                     == Some("always")
-                || self.matches.get_flag("force-colorization")),
+                || self.matches.get_flag("force-colorization")
+                || self.number_from_cli
+                || self.number_nonblank_from_cli),
             tab_width: self
                 .matches
                 .get_one::<String>("tabs")
@@ -268,16 +453,36 @@ impl App {
                         4
                     },
                 ),
-            strip_ansi: match self
-                .matches
-                .get_one::<String>("strip-ansi")
-                .map(|s| s.as_str())
-            {
-                Some("never") => StripAnsiMode::Never,
-                Some("always") => StripAnsiMode::Always,
-                Some("auto") => StripAnsiMode::Auto,
-                _ => unreachable!("other values for --strip-ansi are not allowed"),
+            strip_ansi: {
+                let sanitize = parse_strip_ansi_value(
+                    self.matches
+                        .get_one::<String>("sanitize")
+                        .map(|s| s.as_str()),
+                    "--sanitize",
+                );
+                let strip_ansi = parse_strip_ansi_value(
+                    self.matches
+                        .get_one::<String>("strip-ansi")
+                        .map(|s| s.as_str()),
+                    "--strip-ansi",
+                );
+                // --sanitize implies --strip-ansi to the same value.
+                if sanitize != StripAnsiMode::Never {
+                    sanitize
+                } else {
+                    strip_ansi
+                }
             },
+            sanitize: parse_strip_ansi_value(
+                self.matches
+                    .get_one::<String>("sanitize")
+                    .map(|s| s.as_str()),
+                "--sanitize",
+            ),
+            quiet_empty: self.matches.get_flag("quiet-empty"),
+            unbuffered: self.matches.get_flag("unbuffered"),
+            number_nonblank: self.matches.get_flag("number-nonblank")
+                || self.number_nonblank_from_cli,
             theme: theme(self.theme_options()).to_string(),
             visible_lines: match self.matches.try_contains_id("diff").unwrap_or_default()
                 && self.matches.get_flag("diff")
@@ -332,7 +537,7 @@ impl App {
         })
     }
 
-    pub fn inputs(&self) -> Result<Vec<Input>> {
+    pub fn inputs(&self) -> Result<Vec<Input<'_>>> {
         let filenames: Option<Vec<&Path>> = self
             .matches
             .get_many::<PathBuf>("file-name")
@@ -396,9 +601,26 @@ impl App {
             ])));
         }
 
+        // Only line numbers for non-blank lines if `--number-nonblank`.
+        if self.matches.get_flag("number-nonblank") || self.number_nonblank_from_cli {
+            return Some(StyleComponents(HashSet::from([
+                StyleComponent::LineNumbers,
+            ])));
+        }
+
         // Plain if `--plain` is specified at least once.
         if self.matches.get_count("plain") > 0 {
-            return Some(StyleComponents(HashSet::from([StyleComponent::Plain])));
+            let mut components = HashSet::from([StyleComponent::Plain]);
+            // When --diff is active, preserve change markers and snip separators
+            // so that diff output remains visually useful.
+            if self.matches.try_contains_id("diff").unwrap_or_default()
+                && self.matches.get_flag("diff")
+            {
+                #[cfg(feature = "git")]
+                components.insert(StyleComponent::Changes);
+                components.insert(StyleComponent::Snip);
+            }
+            return Some(StyleComponents(components));
         }
 
         // Default behavior.
@@ -435,21 +657,27 @@ impl App {
             bat_warning!("Style 'rule' is a subset of style 'grid', 'rule' will not be visible.");
         }
 
+        // Auto-disable line numbers in unbuffered mode to avoid confusion with partial lines
+        if self.matches.get_flag("unbuffered") {
+            styled_components.0.remove(&StyleComponent::LineNumbers);
+        }
+
         Ok(styled_components)
     }
 
-    fn theme_options(&self) -> ThemeOptions {
-        let theme = self
-            .matches
+    pub(crate) fn theme_options(&self) -> ThemeOptions {
+        Self::theme_options_from_matches(&self.matches)
+    }
+
+    fn theme_options_from_matches(matches: &ArgMatches) -> ThemeOptions {
+        let theme = matches
             .get_one::<String>("theme")
             .map(|t| ThemePreference::from_str(t).unwrap())
             .unwrap_or_default();
-        let theme_dark = self
-            .matches
+        let theme_dark = matches
             .get_one::<String>("theme-dark")
             .map(|t| ThemeName::from_str(t).unwrap());
-        let theme_light = self
-            .matches
+        let theme_light = matches
             .get_one::<String>("theme-light")
             .map(|t| ThemeName::from_str(t).unwrap());
         ThemeOptions {

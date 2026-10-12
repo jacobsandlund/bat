@@ -145,7 +145,7 @@ git show v0.6.0:src/main.rs | bat -l rs
 Вы можете использовать `bat` с `git diff` для просмотра строк кода вокруг изменений с подсветкой синтаксиса:
 ```bash
 batdiff() {
-    git diff --name-only --relative --diff-filter=d | xargs bat --diff
+    git diff --name-only --relative --diff-filter=d -z | xargs -0 bat --diff
 }
 ```
 Если вы хотите использовать это как отдельную программу, посмотрите `batdiff` из [`bat-extras`](https://github.com/eth-p/bat-extras).
@@ -388,7 +388,7 @@ scoop install bat
 
 ### Из исходников
 
-Если вы желаете установить `bat` из исходников, вам понадобится Rust 1.74.0 или выше. После этого используйте `cargo`, чтобы всё скомпилировать:
+Если вы желаете установить `bat` из исходников, вам понадобится Rust 1.79.0 или выше. После этого используйте `cargo`, чтобы всё скомпилировать:
 
 ```bash
 cargo install --locked bat

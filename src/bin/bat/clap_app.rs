@@ -1,7 +1,5 @@
 use bat::style::StyleComponentList;
-use clap::{
-    crate_name, crate_version, value_parser, Arg, ArgAction, ArgGroup, ColorChoice, Command,
-};
+use clap::{crate_name, crate_version, value_parser, Arg, ArgAction, ColorChoice, Command};
 use once_cell::sync::Lazy;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -16,7 +14,7 @@ static VERSION: Lazy<String> = Lazy::new(|| {
     if git_version.is_empty() {
         crate_version!().to_string()
     } else {
-        format!("{} ({})", crate_version!(), git_version)
+        format!("{} ({git_version})", crate_version!())
     }
 });
 
@@ -34,6 +32,8 @@ pub fn build_app(interactive_output: bool) -> Command {
         .args_conflicts_with_subcommands(true)
         .allow_external_subcommands(true)
         .disable_help_subcommand(true)
+        .disable_help_flag(true)
+        .disable_version_flag(true)
         .max_term_width(100)
         .about("A cat(1) clone with wings.")
         .long_about("A cat(1) clone with syntax highlighting and Git integration.")
@@ -52,6 +52,7 @@ pub fn build_app(interactive_output: bool) -> Command {
                 .long("show-all")
                 .alias("show-nonprintable")
                 .short('A')
+                .overrides_with("show-all")
                 .action(ArgAction::SetTrue)
                 .conflicts_with("language")
                 .help("Show non-printable characters (space, tab, newline, ..).")
@@ -97,6 +98,7 @@ pub fn build_app(interactive_output: bool) -> Command {
             Arg::new("plain")
                 .overrides_with("plain")
                 .overrides_with("number")
+                .overrides_with("number-nonblank")
                 .short('p')
                 .long("plain")
                 .action(ArgAction::Count)
@@ -118,6 +120,17 @@ pub fn build_app(interactive_output: bool) -> Command {
                      specified as a name (like 'C++' or 'LaTeX') or possible file extension \
                      (like 'cpp', 'hpp' or 'md'). Use '--list-languages' to show all supported \
                      language names and file extensions.",
+                ),
+        )
+        .arg(
+            Arg::new("fallback-syntax")
+                .long("fallback-syntax")
+                .visible_alias("fallback-language")
+                .help("Set a fallback language for undetected syntaxes.")
+                .long_help(
+                    "Set a fallback language for syntax highlighting when auto-detection fails. \
+                     Unlike '--language', this is only used when no syntax could be detected from \
+                     filename, custom syntax mappings, or first-line detection.",
                 ),
         )
         .arg(
@@ -159,6 +172,7 @@ pub fn build_app(interactive_output: bool) -> Command {
                     Arg::new("diff")
                         .long("diff")
                         .short('d')
+                        .overrides_with("diff")
                         .action(ArgAction::SetTrue)
                         .conflicts_with("line-range")
                         .help("Only show lines that have been added/removed/modified.")
@@ -211,11 +225,11 @@ pub fn build_app(interactive_output: bool) -> Command {
                 .long("wrap")
                 .overrides_with("wrap")
                 .value_name("mode")
-                .value_parser(["auto", "never", "character"])
+                .value_parser(["auto", "never", "character", "word"])
                 .default_value("auto")
                 .hide_default_value(true)
-                .help("Specify the text-wrapping mode (*auto*, never, character).")
-                .long_help("Specify the text-wrapping mode (*auto*, never, character). \
+                .help("Specify the text-wrapping mode (*auto*, never, character, word).")
+                .long_help("Specify the text-wrapping mode (*auto*, never, character, word). \
                            The '--terminal-width' option can be used in addition to \
                            control the output width."),
         )
@@ -223,12 +237,14 @@ pub fn build_app(interactive_output: bool) -> Command {
             Arg::new("chop-long-lines")
                 .long("chop-long-lines")
                 .short('S')
+                .overrides_with("chop-long-lines")
                 .action(ArgAction::SetTrue)
                 .help("Truncate all lines longer than screen width. Alias for '--wrap=never'."),
         )
         .arg(
             Arg::new("terminal-width")
                 .long("terminal-width")
+                .overrides_with("terminal-width")
                 .value_name("width")
                 .hide_short_help(true)
                 .allow_hyphen_values(true)
@@ -244,10 +260,13 @@ pub fn build_app(interactive_output: bool) -> Command {
                             })
                             .map_err(|e| e.to_string())
                     })
-                .help(
+                .help("Explicitly set the width of the terminal instead of determining it automatically.")
+                .long_help(
                     "Explicitly set the width of the terminal instead of determining it \
                      automatically. If prefixed with '+' or '-', the value will be treated \
-                     as an offset to the actual terminal width. See also: '--wrap'.",
+                     as an offset to the actual terminal width. This can also be configured \
+                     via the BAT_WIDTH environment variable (e.g. export BAT_WIDTH=\"100\"). \
+                     See also: '--wrap'.",
                 ),
         )
         .arg(
@@ -260,6 +279,23 @@ pub fn build_app(interactive_output: bool) -> Command {
                 .long_help(
                     "Only show line numbers, no other decorations. This is an alias for \
                      '--style=numbers'",
+                ),
+        )
+        .arg(
+            Arg::new("number-nonblank")
+                .long("number-nonblank")
+                .overrides_with("number-nonblank")
+                .short('b')
+                .action(ArgAction::SetTrue)
+                .help("Show line numbers for non-blank lines only (alias for '--style=numbers').")
+                .long_help(
+                    "Only show line numbers for non-blank lines, no other decorations. This is an \
+                     alias for '--style=numbers'. Non-blank lines are lines that contain any \
+                     character before the line ending, including spaces and tabs. When used \
+                     together with --number (-n), --number-nonblank (-b) takes precedence.\n\n\
+                     Example:\n  \
+                     printf 'alpha\\n\\nbeta\\n' | bat -b\n  \
+                     numbers 'alpha' and 'beta', but skips the empty line.",
                 ),
         )
         .arg(
@@ -299,9 +335,10 @@ pub fn build_app(interactive_output: bool) -> Command {
                 .help("When to show the decorations (*auto*, never, always).")
                 .long_help(
                     "Specify when to use the decorations that have been specified \
-                     via '--style'. The automatic mode only enables decorations if \
-                     an interactive terminal is detected. Possible values: *auto*, never, always.",
-                ),
+                    via '--style'. The automatic mode only enables decorations if \
+                    an interactive terminal is detected. The always mode will show \
+                    decorations even when piping output. Possible values: *auto*, never, always.",
+                )
         )
         .arg(
             Arg::new("force-colorization")
@@ -328,7 +365,7 @@ pub fn build_app(interactive_output: bool) -> Command {
                 .help("Specify when to use the pager, or use `-P` to disable (*auto*, never, always).")
                 .long_help(
                     "Specify when to use the pager. To disable the pager, use \
-                    --paging=never' or its alias,'-P'. To disable the pager permanently, \
+                    '--paging=never' or its alias,'-P'. To disable the pager permanently, \
                     set BAT_PAGING to 'never'. To control which pager is used, see the \
                     '--pager' option. Possible values: *auto*, never, always."
                 ),
@@ -354,6 +391,7 @@ pub fn build_app(interactive_output: bool) -> Command {
                 .long_help(
                     "Determine which pager is used. This option will override the \
                     PAGER and BAT_PAGER environment variables. The default pager is 'less'. \
+                    If you provide '--pager=builtin', use the built-in 'minus' pager. \
                     To control when the pager is used, see the '--paging' option. \
                     Example: '--pager \"less -RF\"'."
                 ),
@@ -438,6 +476,7 @@ pub fn build_app(interactive_output: bool) -> Command {
             Arg::new("squeeze-blank")
                 .long("squeeze-blank")
                 .short('s')
+                .overrides_with("squeeze-blank")
                 .action(ArgAction::SetTrue)
                 .help("Squeeze consecutive empty lines.")
                 .long_help("Squeeze consecutive empty lines into a single empty line.")
@@ -461,6 +500,24 @@ pub fn build_app(interactive_output: bool) -> Command {
                 .long_help("Specify when to strip ANSI escape sequences from the input. \
                 The automatic mode will remove escape sequences unless the syntax highlighting \
                 language is plain text. Possible values: auto, always, *never*.")
+                .hide_short_help(true)
+        )
+        .arg(
+            Arg::new("sanitize")
+                .long("sanitize")
+                .overrides_with("sanitize")
+                .value_name("when")
+                .value_parser(["auto", "always", "never"])
+                .default_value("never")
+                .hide_default_value(true)
+                .help("Sanitize untrusted input for safe display (auto, always, *never*)")
+                .long_help("Specify when to sanitize input bytes for safe terminal display. \
+                Implies --strip-ansi to the same value, and additionally substitutes \
+                terminal-active control bytes (cursor moves, charset switches, beep, etc.) \
+                and Unicode bidi / zero-width formatting characters with the Unicode \
+                replacement character (U+FFFD). Tab, LF, FF, and CRLF pass through. Useful \
+                for displaying untrusted file content (e.g. file-manager preview panes). \
+                Possible values: auto, always, *never*.")
                 .hide_short_help(true)
         )
         .arg(
@@ -517,6 +574,7 @@ pub fn build_app(interactive_output: bool) -> Command {
                 .short('r')
                 .action(ArgAction::Append)
                 .value_name("N:M")
+                .allow_hyphen_values(true)
                 .help("Only print the lines from N to M.")
                 .long_help(
                     "Only print the specified range of lines for each file. \
@@ -525,7 +583,10 @@ pub fn build_app(interactive_output: bool) -> Command {
                      '--line-range :40' prints lines 1 to 40\n  \
                      '--line-range 40:' prints lines 40 to the end of the file\n  \
                      '--line-range 40' only prints line 40\n  \
-                     '--line-range 30:+10' prints lines 30 to 40",
+                     '--line-range -10:' prints the last 10 lines\n  \
+                     '--line-range 30:+10' prints lines 30 to 40\n  \
+                     '--line-range 35::5' prints lines 30 to 40 (line 35 with 5 lines of context)\n  \
+                     '--line-range 30:40:2' prints lines 28 to 42 (range 30-40 with 2 lines of context)",
                 ),
         )
         .arg(
@@ -541,12 +602,16 @@ pub fn build_app(interactive_output: bool) -> Command {
             Arg::new("unbuffered")
                 .short('u')
                 .long("unbuffered")
+                .overrides_with("unbuffered")
                 .action(ArgAction::SetTrue)
-                .hide_short_help(true)
+                .help("Enable unbuffered input reading for streaming use cases.")
                 .long_help(
-                    "This option exists for POSIX-compliance reasons ('u' is for \
-                     'unbuffered'). The output is always unbuffered - this option \
-                     is simply ignored.",
+                    "Enable unbuffered input reading. When this flag is set, bat will \
+                     display data as soon as it is available, without waiting for a \
+                     complete line. This is useful for streaming use cases like \
+                     'tail -f logfile | bat -u --paging=never'. Note that line numbers \
+                     are automatically disabled in unbuffered mode, and syntax \
+                     highlighting may be imperfect on partial lines.",
                 ),
         )
         .arg(
@@ -559,6 +624,7 @@ pub fn build_app(interactive_output: bool) -> Command {
         .arg(
             Arg::new("no-custom-assets")
                 .long("no-custom-assets")
+                .overrides_with("no-custom-assets")
                 .action(ArgAction::SetTrue)
                 .hide(true)
                 .help("Do not load custom assets"),
@@ -636,6 +702,19 @@ pub fn build_app(interactive_output: bool) -> Command {
                 .help("Show diagnostic information for bug reports."),
         )
         .arg(
+            Arg::new("quiet-empty")
+                .long("quiet-empty")
+                .short('E')
+                .overrides_with("quiet-empty")
+                .action(ArgAction::SetTrue)
+                .help("Produce no output when the input is empty.")
+                .long_help(
+                    "When this flag is set, bat will produce no output at all when \
+                     the input is empty. This is useful when piping commands that may \
+                     produce empty output, like 'git diff'.",
+                ),
+        )
+        .arg(
             Arg::new("acknowledgements")
                 .long("acknowledgements")
                 .action(ArgAction::SetTrue)
@@ -645,9 +724,25 @@ pub fn build_app(interactive_output: bool) -> Command {
         .arg(
             Arg::new("set-terminal-title")
                 .long("set-terminal-title")
+                .overrides_with("set-terminal-title")
                 .action(ArgAction::SetTrue)
                 .hide_short_help(true)
                 .help("Sets terminal title to filenames when using a pager."),
+        )
+        .arg(
+            Arg::new("help")
+                .short('h')
+                .long("help")
+                .action(ArgAction::SetTrue)
+                .help("Print help (see more with '--help')")
+                .long_help("Print help (see a summary with '-h')"),
+        )
+        .arg(
+            Arg::new("version")
+                .long("version")
+                .short('V')
+                .action(ArgAction::Version)
+                .help("Print version"),
         );
 
     // Check if the current directory contains a file name cache. Otherwise,
@@ -659,11 +754,20 @@ pub fn build_app(interactive_output: bool) -> Command {
             Command::new("cache")
                 .hide(true)
                 .about("Modify the syntax-definition and theme cache")
+                .arg_required_else_help(true)
+                .arg(
+                    Arg::new("help")
+                        .short('h')
+                        .long("help")
+                        .action(ArgAction::Help)
+                        .help("Print help"),
+                )
                 .arg(
                     Arg::new("build")
                         .long("build")
                         .short('b')
                         .action(ArgAction::SetTrue)
+                        .conflicts_with("clear")
                         .help("Initialize (or update) the syntax/theme cache.")
                         .long_help(
                             "Initialize (or update) the syntax/theme cache by loading from \
@@ -675,12 +779,8 @@ pub fn build_app(interactive_output: bool) -> Command {
                         .long("clear")
                         .short('c')
                         .action(ArgAction::SetTrue)
+                        .conflicts_with("build")
                         .help("Remove the cached syntax definitions and themes."),
-                )
-                .group(
-                    ArgGroup::new("cache-actions")
-                        .args(["build", "clear"])
-                        .required(true),
                 )
                 .arg(
                     Arg::new("source")
